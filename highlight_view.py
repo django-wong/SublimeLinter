@@ -440,7 +440,7 @@ def prepare_highlights_data(view, linter_name, errors, demote_predicate):
         selected_text = view.substr(region)
         # Work around Sublime bug, which cannot draw 'underlines' on spaces
         if mark_style in UNDERLINE_STYLES and SOME_WS.search(selected_text):
-            mark_style = FALLBACK_MARK_STYLE
+            mark_style = persist.settings.get('fallback_mark_style', FALLBACK_MARK_STYLE)
 
         flags = MARK_STYLES[mark_style]
         if not persist.settings.get('show_marks_in_minimap'):

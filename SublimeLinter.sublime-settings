@@ -207,6 +207,13 @@
         }
     ],
 
+    // The fallback will be used when trying draw mark underline style mark on
+    // whitespaces. Only non-underline style supported
+    // - "none"
+    // - "fill"
+    // - "outline"
+    "fallback_mark_style": "outline",
+
     // DEPRECATED: use the selector linter setting instead:
     // http://www.sublimelinter.com/en/stable/linter_settings.html#selector
     // Maps variant syntaxes to the syntax that you have a linter for.
