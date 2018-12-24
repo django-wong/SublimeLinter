@@ -94,6 +94,9 @@ class VirtualView:
         start, end = self.full_line(line)
         return self._code[start:end]
 
+    def max_lines(self):
+        return len(self._newlines) - 2
+
     # Actual Sublime API would look like:
     # def full_line(self, region)
     # def full_line(self, point) => Region
@@ -920,7 +923,37 @@ class Linter(metaclass=LinterMeta):
             raise TransientError('View not consistent.')
 
         virtual_view = VirtualView(code)
-        return self.parse_output(output, virtual_view)
+        return self.filter_errors(self.parse_output(output, virtual_view))
+
+    def filter_errors(self, errors):
+        filter_patterns = self.get_view_settings().get('filter_errors') or []
+        if isinstance(filter_patterns, str):
+            filter_patterns = [filter_patterns]
+
+        filters = []
+        try:
+            for pattern in filter_patterns:
+                try:
+                    filters.append(re.compile(pattern, re.I))
+                except re.error as err:
+                    logger.error(
+                        "'{}' in 'filter_errors' is not a valid "
+                        "regex pattern: '{}'.".format(pattern, err)
+                    )
+
+        except TypeError:
+            logger.error(
+                "'filter_errors' must be set to a string or a list of strings.\n"
+                "Got '{}' instead".format(filter_patterns))
+
+        return [
+            error
+            for error in errors
+            if not any(
+                pattern.search(': '.join([error['error_type'], error['code'], error['msg']]))
+                for pattern in filters
+            )
+        ]
 
     def parse_output(self, proc, virtual_view):
         # Note: We support type str for `proc`. E.g. the user might have
@@ -946,14 +979,13 @@ class Linter(metaclass=LinterMeta):
     def parse_output_via_regex(self, output, virtual_view):
         if not output:
             logger.info('{}: no output'.format(self.name))
-            return []
+            return
 
         if logger.isEnabledFor(logging.INFO):
             import textwrap
             logger.info('{}: output:\n{}'.format(
                 self.name, textwrap.indent(output.strip(), '  ')))
 
-        errors = []
         for m in self.find_errors(output):
             if not m or not m[0]:
                 continue
@@ -962,10 +994,7 @@ class Linter(metaclass=LinterMeta):
                 m = LintMatch(*m)
 
             if m.message and m.line is not None:
-                error = self.process_match(m, virtual_view)
-                errors.append(error)
-
-        return errors
+                yield self.process_match(m, virtual_view)
 
     def find_errors(self, output):
         """
@@ -1038,15 +1067,26 @@ class Linter(metaclass=LinterMeta):
         error_type = self.get_error_type(m.error, m.warning)
 
         col = m.col
+        line = m.line
+
+        # Ensure `line` is within bounds
+        line = max(min(line, vv.max_lines()), 0)
+        if line != m.line:
+            logger.warning(
+                "Reported line '{}' is not within the code we're linting.\n"
+                "Maybe the linter reports problems from multiple files "
+                "or `line_col_base` is not set correctly."
+                .format(m.line + self.line_col_base[0])
+            )
 
         if col is not None:
-            col = self.maybe_fix_tab_width(m.line, col, vv)
+            col = self.maybe_fix_tab_width(line, col, vv)
 
             # Pin the column to the start/end line offsets
-            start, end = vv.full_line(m.line)
+            start, end = vv.full_line(line)
             col = max(min(col, (end - start) - 1), 0)
 
-        line, start, end = self.reposition_match(m.line, col, m, vv)
+        line, start, end = self.reposition_match(line, col, m, vv)
         return {
             "line": line,
             "start": start,
