@@ -1,4 +1,4 @@
-from collections import namedtuple, OrderedDict, ChainMap, Mapping, Sequence
+from collections import ChainMap, Mapping, Sequence
 from contextlib import contextmanager
 from fnmatch import fnmatch
 import logging
@@ -11,6 +11,11 @@ import tempfile
 import sublime
 from . import persist, util
 from .const import WARNING, ERROR
+
+
+MYPY = False
+if MYPY:
+    from typing import Match
 
 
 logger = logging.getLogger(__name__)
@@ -43,20 +48,63 @@ _ACCEPTABLE_REASONS_MAP = {
 
 BASE_LINT_ENVIRONMENT = ChainMap(UTF8_ENV_VARS, os.environ)
 
+LEGACY_LINT_MATCH_DEF = ("match", "line", "col", "error", "warning", "message", "near")
+COMMON_CAPTURING_NAMES = ("filename", "error_type", "code") + LEGACY_LINT_MATCH_DEF
 
-MATCH_DICT = OrderedDict(
-    (
-        ("match", None),
-        ("line", None),
-        ("col", None),
-        ("error", None),
-        ("warning", None),
-        ("message", ''),
-        ("near", None)
-    )
-)
-LintMatch = namedtuple("LintMatch", MATCH_DICT.keys())
-LintMatch.__new__.__defaults__ = tuple(MATCH_DICT.values())
+
+class LintMatch(dict):
+    """Convenience dict-a-like type representing Lint errors.
+
+    Historically, lint errors were tuples, and later namedtuples. This dict
+    class implements enough to be backwards compatible to a namedtuple as a
+    `LEGACY_LINT_MATCH_DEF` set.
+
+    Some convenience for the user: All present keys can be accessed like an
+    attribute. All commonly used names (see: COMMON_CAPTURING_NAMES) can
+    be safely accessed like an attribute, returning `None` if not present.
+    E.g.
+
+        error = LintMatch({'foo': 'bar'})
+        error.foo  # 'bar'
+        error.error_type  # None
+        error.quux  # raises AttributeError
+
+    """
+
+    def __init__(self, *args, **kwargs):
+        if len(args) == 7:
+            self.update(zip(LEGACY_LINT_MATCH_DEF, args))
+        else:
+            super().__init__(*args, **kwargs)
+
+    def _replace(self, **kwargs):
+        self.update(kwargs)
+        return self
+
+    def __getattr__(self, name):
+        if name in COMMON_CAPTURING_NAMES:
+            return self.get(name, '' if name == 'message' else None)
+
+        try:
+            return self[name]
+        except KeyError:
+            raise AttributeError(
+                "'{}' object has no attribute '{}'".format(type(self).__name__, name)
+            ) from None
+
+    def __getitem__(self, name):
+        if isinstance(name, int):
+            return tuple(iter(self))[name]
+        return super().__getitem__(name)
+
+    def __iter__(self):
+        return iter(tuple(getattr(self, name) for name in LEGACY_LINT_MATCH_DEF))
+
+    def copy(self):
+        return type(self)(self)
+
+    def __repr__(self):
+        return "{}({})".format(type(self).__name__, super().__repr__())
 
 
 class TransientError(Exception):
@@ -103,6 +151,12 @@ class VirtualView:
     # def substr(self, region)
     # def text_point(self, row, col) => Point
     # def rowcol(self, point) => (row, col)
+
+    @staticmethod
+    def from_file(filename):
+        """Return a VirtualView with the contents of file."""
+        with open(filename, 'r', encoding='utf8') as f:
+            return VirtualView(f.read())
 
 
 class ViewSettings:
@@ -564,6 +618,8 @@ class Linter(metaclass=LinterMeta):
         if self.defaults is not None:
             self.defaults = self.defaults.copy()
 
+        self.temp_filename = None
+
     @property
     def filename(self):
         """Return the view's file path or '' if unsaved."""
@@ -805,14 +861,6 @@ class Linter(metaclass=LinterMeta):
         """Return runtime environment for this lint."""
         return ChainMap({}, settings.get('env', {}), self.env, BASE_LINT_ENVIRONMENT)
 
-    def get_error_type(self, error, warning):  # noqa:D102
-        if error:
-            return ERROR
-        elif warning:
-            return WARNING
-        else:
-            return self.default_type
-
     @classmethod
     def can_lint_view(cls, view, settings):
         if cls.disabled is True:
@@ -949,7 +997,7 @@ class Linter(metaclass=LinterMeta):
         return [
             error
             for error in errors
-            if not any(
+            if error is not None and not any(
                 pattern.search(': '.join([error['error_type'], error['code'], error['msg']]))
                 for pattern in filters
             )
@@ -1022,49 +1070,76 @@ class Linter(metaclass=LinterMeta):
                     logger.info(
                         "{}: No match for line: '{}'".format(self.name, line))
 
-    def split_match(self, match):
+    def split_match(self, match):  # type: (Match) -> LintMatch
+        """Convert the regex match to a `LintMatch`
+
+        Basically, a `LintMatch` is the dict of the named capturing groups
+        of the user provided regex (AKA `match.groupdict()`).
+
+        The only difference is that we cast `line` and `col` to int's if
+        provided.
+
+        Plugin authors can implement this method to skip or modify errors.
+        Notes: If you want to skip this error just return `None`. If you want
+        to modify the values just mutate the dict. E.g.
+
+            error = super().split_match(match)
+            error['message'] = 'The new message'
+            # OR:
+            error.update({'message': 'Hi!'})
+            return error
+
         """
-        Split a match into the standard elements of an error and return them.
+        error = LintMatch(match.groupdict())
+        error["match"] = match
 
-        If subclasses need to modify the values returned by the regex, they
-        should override this method, call super(), then modify the values
-        and return them.
-
-        """
-        match_dict = MATCH_DICT.copy()
-
-        match_dict.update({
-            k: v
-            for k, v in match.groupdict().items()
-            if k in match_dict
-        })
-        match_dict["match"] = match
-
-        # normalize line and col if necessary
-        line = match_dict["line"]
-        if line:
-            match_dict["line"] = int(line) - self.line_col_base[0]
+        # Normalize line and col if necessary
+        try:
+            line = error['line']
+        except KeyError:
+            pass
         else:
-            # `line` is not optional, but if a user implements `split_match`
-            # and calls `super` first, she has still the chance to fill in
-            # a value on her own.
-            match_dict["line"] = None
+            if line:
+                error['line'] = int(line) - self.line_col_base[0]
+            else:  # Exchange the empty string with `None`
+                error['line'] = None
 
-        col = match_dict["col"]
-        if col:
-            if col.isdigit():
-                col = int(col) - self.line_col_base[1]
-            else:
-                col = len(col)
-            match_dict["col"] = col
+        try:
+            col = error['col']
+        except KeyError:
+            pass
         else:
-            # `col` is optional, so we exchange an empty string with None
-            match_dict["col"] = None
+            if col:
+                if col.isdigit():
+                    col = int(col) - self.line_col_base[1]
+                else:
+                    col = len(col)
+                error['col'] = col
+            else:  # Exchange the empty string with `None`
+                error['col'] = None
 
-        return LintMatch(**match_dict)
+        return error
 
     def process_match(self, m, vv):
-        error_type = self.get_error_type(m.error, m.warning)
+        error_type = m.error_type or self.get_error_type(m.error, m.warning)
+        code = m.code or m.error or m.warning or ''
+
+        # determine a filename for this match
+        filename = self.normalize_filename(m.filename)
+
+        if filename:
+            # this is a match for a different file so we need its contents for
+            # the below checks
+            try:
+                vv = VirtualView.from_file(filename)
+            except OSError as err:
+                # warn about the error and drop this match
+                logger.warning('Exception: {}'.format(str(err)))
+                self.notify_failure()
+                return None
+        else:  # main file
+            # use the filename of the current view
+            filename = self.view.file_name() or "<untitled {}>".format(self.view.buffer_id())
 
         col = m.col
         line = m.line
@@ -1087,14 +1162,58 @@ class Linter(metaclass=LinterMeta):
             col = max(min(col, (end - start) - 1), 0)
 
         line, start, end = self.reposition_match(line, col, m, vv)
+
+        # find the region to highlight for this error
+        line_start, _ = vv.full_line(line)
+        region = sublime.Region(line_start + start, line_start + end)
+        if len(region) == 0:
+            region.b += 1
+
         return {
+            "filename": filename,
             "line": line,
             "start": start,
             "end": end,
+            "region": region,
             "error_type": error_type,
-            "code": m.error or m.warning or '',
+            "code": code,
             "msg": m.message.strip(),
         }
+
+    def get_error_type(self, error, warning):
+        if error:
+            return ERROR
+        elif warning:
+            return WARNING
+        else:
+            return self.default_type
+
+    def normalize_filename(self, filename):
+        """Return an absolute filename if it is not the main file."""
+        if filename and not self.is_stdin_filename(filename):
+            # ensure that the filename is absolute by basing relative paths on
+            # the working directory
+            cwd = self.get_working_dir(self.settings) or os.path.realpath('.')
+            filename = os.path.normpath(os.path.join(cwd, filename))
+
+            # only return a filename if it is a different file
+            normed_filename = os.path.normcase(filename)
+            if normed_filename == os.path.normcase(self.filename):
+                return None
+
+            # when the command was run on a temporary file we also need to
+            # compare this filename with that temporary filename
+            if self.temp_filename and normed_filename == os.path.normcase(self.temp_filename):
+                return None
+
+            return filename
+
+        # must be the main file
+        return None
+
+    @staticmethod
+    def is_stdin_filename(filename):
+        return filename in ["stdin", "<stdin>", "-"]
 
     def maybe_fix_tab_width(self, line, col, vv):
         # Adjust column numbers to match the linter's tabs if necessary
@@ -1216,6 +1335,9 @@ class Linter(metaclass=LinterMeta):
             suffix = self.get_tempfile_suffix()
 
         with make_temp_file(suffix, code) as file:
+            # store this filename to assign its errors to the main file later
+            self.temp_filename = file.name
+
             ctx = get_view_context(self.view)
             ctx['file_on_disk'] = self.filename
             ctx['temp_file'] = file.name

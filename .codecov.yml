@@ -1,4 +1,13 @@
-comment:
-  layout: "files"
-  behavior: default
-  require_changes: true  # if true: only post the comment if coverage changes
+comment: off
+
+coverage:
+  range: 50...85
+  precision: 2
+  round: down
+  status:
+    project:
+      default:
+       threshold: 1%
+       if_not_found: success
+    patch: off
+    changes: off
