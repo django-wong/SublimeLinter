@@ -10,6 +10,7 @@ from SublimeLinter.tests.parameterized import parameterized as p
 import sublime
 from SublimeLinter.lint import (
     Linter,
+    LintMatch,
     linter as linter_module,
     backend,
     persist,
@@ -29,6 +30,8 @@ from SublimeLinter.tests.mockito import (
 
 version = sublime.version()
 
+RUNNING_ON_LINUX_TRAVIS = os.environ.get('TRAVIS_OS_NAME') == 'linux'
+expectedFailureOnLinuxTravis = expectedFailure if RUNNING_ON_LINUX_TRAVIS else lambda f: f
 
 VIEW_UNCHANGED = lambda: False  # noqa: E731
 execute_lint_task = partial(
@@ -817,6 +820,19 @@ class TestRegexBasedParsing(_BaseTestCase):
 
         self.assertEqual(result[0]['filename'], __file__)
 
+    @expectedFailureOnLinuxTravis
+    def test_ensure_correct_filename_case_UNC(self):
+        FILENAME = "\\\\HOST\\a\\b\\c.py"
+        INPUT = "0123456789"
+        OUTPUT = FILENAME + ":1:1 ERROR: The message"
+
+        linter = self.create_linter(FakeLinterCaptureFilename)
+        when(linter)._communicate(...).thenReturn(OUTPUT)
+        when(self.view).file_name().thenReturn(FILENAME)
+
+        result = execute_lint_task(linter, INPUT)
+        self.assertEqual(result[0]['filename'], FILENAME)
+
     @p.expand([
         (FakeLinterCaptureFilename, "0123456789", "stdin:1:1 ERROR: The message"),
         (FakeLinterCaptureFilename, "0123456789", "<stdin>:1:1 ERROR: The message"),
@@ -1045,24 +1061,6 @@ class TestSplitMatchContract(_BaseTestCase):
 
         self.assertResult([], result)
 
-    @p.expand([('empty_string', ''), ('none', None), ('false', False)])
-    def test_do_not_pass_if_1st_item_is_falsy(self, _, FALSY):
-        linter = self.create_linter()
-
-        INPUT = "0123456789"
-        OUTPUT = "stdin:1:1 ERROR: The message"
-        when(linter)._communicate(['fake_linter_1'], INPUT).thenReturn(OUTPUT)
-
-        def split_match(match):
-            m = Linter.split_match(linter, match)
-            match_, line, col, error, warning, message, near = m
-            return FALSY, line, col, error, warning, message, near
-
-        with expect(linter, times=1).split_match(...).thenAnswer(split_match):
-            result = linter.lint(INPUT, VIEW_UNCHANGED)
-
-        self.assertEqual(0, len(result))
-
     def test_do_not_pass_if_2nd_item_is_None(self):
         linter = self.create_linter()
 
@@ -1112,6 +1110,38 @@ class TestSplitMatchContract(_BaseTestCase):
             m = Linter.split_match(linter, match)
             match_, line, col, error, warning, message, near = m
             return TRUTHY, line, col, error, warning, message, near
+
+        with expect(linter, times=1).split_match(...).thenAnswer(split_match):
+            result = linter.lint(INPUT, VIEW_UNCHANGED)
+
+        self.assertEqual(1, len(result))
+
+    def test_match_is_optional(self):
+        linter = self.create_linter()
+
+        INPUT = "0123456789"
+        OUTPUT = "stdin:1:1 ERROR: The message"
+        when(linter)._communicate(['fake_linter_1'], INPUT).thenReturn(OUTPUT)
+
+        def split_match(match):
+            m = Linter.split_match(linter, match)
+            m.pop('match')
+            return m
+
+        with expect(linter, times=1).split_match(...).thenAnswer(split_match):
+            result = linter.lint(INPUT, VIEW_UNCHANGED)
+
+        self.assertEqual(1, len(result))
+
+    def test_only_line_and_message_are_mandatory(self):
+        linter = self.create_linter()
+
+        INPUT = "0123456789"
+        OUTPUT = "stdin:1:1 ERROR: The message"
+        when(linter)._communicate(['fake_linter_1'], INPUT).thenReturn(OUTPUT)
+
+        def split_match(match):
+            return LintMatch(line=1, message="Hi")
 
         with expect(linter, times=1).split_match(...).thenAnswer(split_match):
             result = linter.lint(INPUT, VIEW_UNCHANGED)

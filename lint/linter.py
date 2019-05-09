@@ -15,7 +15,8 @@ from .const import WARNING, ERROR
 
 MYPY = False
 if MYPY:
-    from typing import Match
+    from typing import Any, Callable, Dict, List, Match, Optional, Tuple, Union
+    from .persist import LintError
 
 
 logger = logging.getLogger(__name__)
@@ -111,6 +112,10 @@ class TransientError(Exception):
     ...
 
 
+class PermanentError(Exception):
+    ...
+
+
 # SublimeLinter can lint partial buffers, e.g. `<script>` tags inside a
 # HTML-file. The tiny `VirtualView` is just enough code, so we can get the
 # source code of a line, the linter reported to be problematic.
@@ -203,36 +208,45 @@ class LinterSettings:
     substitute/expand variables found in the settings
     """
 
-    def __init__(self, settings, context):
-        self.settings = settings
+    def __init__(self, raw_settings, context, _computed_settings=None):
+        # type: (Mapping[str, Any], Mapping[str, str], Mapping[str, Any]) -> None
+        self.raw_settings = raw_settings
         self.context = context
 
-        self.computed_settings = {}
+        self._computed_settings = {} if _computed_settings is None else _computed_settings
 
     def __getitem__(self, key):
         try:
-            return self.computed_settings[key]
+            return self._computed_settings[key]
         except KeyError:
             try:
-                value = self.settings[key]
+                value = self.raw_settings[key]
             except KeyError:
                 raise KeyError(key)
             else:
                 final_value = substitute_variables(self.context, value)
-                self.computed_settings[key] = final_value
+                self._computed_settings[key] = final_value
                 return final_value
 
     def get(self, key, default=None):
         return self[key] if key in self else default
 
     def __contains__(self, key):
-        return key in self.computed_settings or key in self.settings
+        return key in self._computed_settings or key in self.raw_settings
 
     def __setitem__(self, key, value):
-        self.computed_settings[key] = value
+        self._computed_settings[key] = value
 
     has = __contains__
     set = __setitem__
+
+    def clone(self):
+        # type: () -> LinterSettings
+        return self.__class__(
+            self.raw_settings,
+            self.context,
+            ChainMap({}, self._computed_settings)
+        )
 
 
 def get_raw_linter_settings(linter, view):
@@ -335,6 +349,9 @@ def substitute_variables(variables, value):
     # `${varname}` syntax and supports placeholders (`${varname:placeholder}`).
 
     if isinstance(value, str):
+        # Workaround https://github.com/SublimeTextIssues/Core/issues/1878
+        # (E.g. UNC paths on Windows start with double slashes.)
+        value = value.replace(r'\\', r'\\\\')
         value = sublime.expand_variables(value, variables)
         return os.path.expanduser(value)
     elif isinstance(value, Mapping):
@@ -389,14 +406,14 @@ class LinterMeta(type):
             'npm_name', 'composer_name'
         ):
             if key in attrs:
-                logger.info(
-                    "{}: Defining 'cls.{}' has no effect anymore. You can "
-                    "safely remove these settings.".format(name, key))
+                logger.warning(
+                    "{}: Defining 'cls.{}' has no effect. Please cleanup and "
+                    "remove these settings.".format(name, key))
 
         for key in ('build_cmd', 'insert_args'):
             if key in attrs:
                 logger.warning(
-                    "{}: Do not implement 'cls.{}()'. SublimeLinter will "
+                    "{}: Do not implement '{}'. SublimeLinter will "
                     "change here in the near future.".format(name, key))
 
         for key in ('can_lint', 'can_lint_syntax'):
@@ -404,6 +421,14 @@ class LinterMeta(type):
                 logger.warning(
                     "{}: Implementing 'cls.{}' has no effect anymore. You "
                     "can safely remove these methods.".format(name, key))
+
+        if 'should_lint' in attrs:
+            logger.warning(
+                "{}: Do *NOT* implement 'should_lint'. SublimeLinter will "
+                "have a breaking change here in the near future.  "
+                "Note: The 'self' you see in there is probably not the "
+                "same 'self' you see in other methods. Do *not* mutate 'self'!"
+                .format(name))
         # END DEPRECATIONS
 
         cmd = attrs.get('cmd')
@@ -504,6 +529,7 @@ class Linter(metaclass=LinterMeta):
     #
     # Public attributes
     #
+    name = ''
 
     # The syntax that the linter handles. May be a string or
     # list/tuple of strings. Names should be all lowercase.
@@ -606,12 +632,13 @@ class Linter(metaclass=LinterMeta):
     disabled = None
 
     def __init__(self, view, settings):
+        # type: (sublime.View, LinterSettings) -> None
         self.view = view
         self.settings = settings
         # Using `self.env` is deprecated, bc it can have surprising
         # side-effects for concurrent/async linting. We initialize it here
         # bc some ruby linters rely on that behavior.
-        self.env = {}
+        self.env = {}  # type: Dict[str, str]
 
         # Ensure instances have their own copy in case a plugin author
         # mangles it.
@@ -636,9 +663,19 @@ class Linter(metaclass=LinterMeta):
         return self.settings
 
     def notify_failure(self):
+        # Side-effect: the status bar will show `(erred)`
         window = self.view.window()
         if window:
             window.run_command('sublime_linter_failed', {
+                'bid': self.view.buffer_id(),
+                'linter_name': self.name
+            })
+
+    def notify_unassign(self):
+        # Side-effect: the status bar will not show the linter at all
+        window = self.view.window()
+        if window:
+            window.run_command('sublime_linter_unassigned', {
                 'bid': self.view.buffer_id(),
                 'linter_name': self.name
             })
@@ -727,6 +764,7 @@ class Linter(metaclass=LinterMeta):
         return self.insert_args(cmd)
 
     def context_sensitive_executable_path(self, cmd):
+        # type: (List[str]) -> Tuple[bool, Union[None, str, List[str]]]
         """Calculate the context-sensitive executable path.
 
         Subclasses may override this to return a special path. The default
@@ -827,17 +865,24 @@ class Linter(metaclass=LinterMeta):
 
             joiner = arg_info['joiner']
             for value in values:
+                # We call `substitute_variables` in `finalize_cmd` on the whole
+                # command. Since all settings are already transparently
+                # 'expanded' we need to make sure to escape remaining '$' chars
+                # in the arg value here which otherwise denote variables within
+                # Sublime.
+                final_value = str(value).replace('$', r'\$')
                 if prefix == '@':
-                    args.append(str(value))
+                    args.append(final_value)
                 elif joiner == '=':
-                    args.append('{}={}'.format(arg, value))
+                    args.append('{}={}'.format(arg, final_value))
                 else:  # joiner == ':' or ''
                     args.append(arg)
-                    args.append(str(value))
+                    args.append(final_value)
 
         return args
 
     def get_working_dir(self, settings):
+        # type: (LinterSettings) -> Optional[str]
         """Return the working dir for this lint."""
         cwd = settings.get('working_dir', None)
 
@@ -924,8 +969,9 @@ class Linter(metaclass=LinterMeta):
         """
         should_lint takes reason then decides whether the linter should start or not.
 
-        should_lint allows each Linter to programmatically decide whether it should take
-        action on each trigger or not.
+        DO NOT USE except for experiments! WILL CHANGE!
+        Note that `self` here is probably not the same `self` you later
+        see e.g. in `split_match`. Do *NOT* mutate `self`!
         """
         # A 'saved-file-only' linter does not run on unsaved views
         if self.tempfile_suffix == '-' and self.view.is_dirty():
@@ -942,6 +988,7 @@ class Linter(metaclass=LinterMeta):
         return reason in _ACCEPTABLE_REASONS_MAP[lint_mode]
 
     def lint(self, code, view_has_changed):
+        # type: (str, Callable[[], bool]) -> List[LintError]
         """Perform the lint, retrieve the results, and add marks to the view.
 
         The flow of control is as follows:
@@ -1035,7 +1082,7 @@ class Linter(metaclass=LinterMeta):
                 self.name, textwrap.indent(output.strip(), '  ')))
 
         for m in self.find_errors(output):
-            if not m or not m[0]:
+            if not m:
                 continue
 
             if not isinstance(m, LintMatch):  # ensure right type
@@ -1134,7 +1181,11 @@ class Linter(metaclass=LinterMeta):
                 vv = VirtualView.from_file(filename)
             except OSError as err:
                 # warn about the error and drop this match
-                logger.warning('Exception: {}'.format(str(err)))
+                logger.warning(
+                    "{} reported errors coming from '{}'. "
+                    "However, reading that file raised:\n  {}."
+                    .format(self.name, filename, str(err))
+                )
                 self.notify_failure()
                 return None
         else:  # main file
@@ -1482,7 +1533,12 @@ def store_proc_while_running(bid, proc):
         yield proc
     finally:
         with persist.active_procs_lock:
-            persist.active_procs[bid].remove(proc)
+            # During hot-reload `active_procs` gets evicted so we must
+            # expect a `ValueError` from time to time
+            try:
+                persist.active_procs[bid].remove(proc)
+            except ValueError:
+                pass
 
 
 RUNNING_TEMPLATE = """{headline}

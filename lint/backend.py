@@ -1,7 +1,6 @@
 import sublime
 
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_EXCEPTION
-from contextlib import contextmanager
 from itertools import chain, count
 from functools import partial
 import hashlib
@@ -9,24 +8,40 @@ import json
 import logging
 import multiprocessing
 import os
-import time
 import threading
 
 from . import style, util, linter as linter_module
+
+
+if False:
+    from typing import Callable, Iterator, List, Optional, Tuple, TypeVar
+    from .persist import LintError
+    Linter = linter_module.Linter
+
+    T = TypeVar('T')
+    LintResult = List[LintError]
+    Task = Callable[[], T]
 
 
 logger = logging.getLogger(__name__)
 
 WILDCARD_SYNTAX = '*'
 MAX_CONCURRENT_TASKS = multiprocessing.cpu_count() or 1
+orchestrator = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_TASKS)
+executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_TASKS)
 
 
 task_count = count(start=1)
 counter_lock = threading.Lock()
-process_limit = threading.BoundedSemaphore(MAX_CONCURRENT_TASKS)
 
 
-def lint_view(linters, view, view_has_changed, next):
+def lint_view(
+    linters,           # type: List[Linter]
+    view,              # type: sublime.View
+    view_has_changed,  # type: Callable[[], bool]
+    next               # type: Callable[[Linter, LintResult], None]
+):
+    # type: (...) -> None
     """Lint the given view.
 
     This is the top level lint dispatcher. It is called
@@ -34,14 +49,15 @@ def lint_view(linters, view, view_has_changed, next):
     """
     lint_tasks = get_lint_tasks(linters, view, view_has_changed)
 
-    run_concurrently(
+    run_concurrently([
         partial(run_tasks, tasks, next=partial(next, linter))
         for linter, tasks in lint_tasks
-    )
+    ], executor=orchestrator)
 
 
 def run_tasks(tasks, next):
-    results = run_concurrently(tasks)
+    # type: (List[Task[LintResult]], Callable[[LintResult], None]) -> None
+    results = run_concurrently(tasks, executor=executor)
     if results is None:
         return  # ABORT
 
@@ -53,32 +69,74 @@ def run_tasks(tasks, next):
     sublime.set_timeout_async(lambda: next(errors))
 
 
-def get_lint_tasks(linters, view, view_has_changed):
+def get_lint_tasks(
+    linters,           # type: List[Linter]
+    view,              # type: sublime.View
+    view_has_changed,  # type: Callable[[], bool]
+):                     # type: (...) -> Iterator[Tuple[Linter, List[Task[LintResult]]]]
+    total_tasks = 0
     for (linter, regions) in get_lint_regions(linters, view):
-        tasks = []
-        for region in regions:
-            code = view.substr(region)
-            offsets = view.rowcol(region.begin()) + (region.begin(),)
-
-            # Due to a limitation in python 3.3, we cannot 'name' a thread when
-            # using the ThreadPoolExecutor. (This feature has been introduced
-            # in python 3.6.) So, we do this manually.
-            task_name = make_good_task_name(linter, view)
-            task = partial(execute_lint_task, linter, code, offsets, view_has_changed)
-            executor = partial(modify_thread_name, task_name, task)
-            tasks.append(executor)
-
+        tasks = _make_tasks(linter, regions, view, view_has_changed)
+        total_tasks += len(tasks)
         yield linter, tasks
+
+    if total_tasks > 4:
+        logger.warning(
+            "'{}' puts in total {}(!) tasks on the queue."
+            .format(short_canonical_filename(view), total_tasks)
+        )
+
+
+def _make_tasks(linter_, regions, view, view_has_changed):
+    # type: (Linter, List[sublime.Region], sublime.View, Callable[[], bool]) -> List[Task[LintResult]]
+    independent_linters = create_n_independent_linters(linter_, len(regions))
+    tasks = []  # type: List[Task[LintResult]]
+    for linter, region in zip(independent_linters, regions):
+        code = view.substr(region)
+        offsets = view.rowcol(region.begin()) + (region.begin(),)
+
+        # Due to a limitation in python 3.3, we cannot 'name' a thread when
+        # using the ThreadPoolExecutor. (This feature has been introduced
+        # in python 3.6.) So, we do this manually.
+        task_name = make_good_task_name(linter, view)
+        task = partial(execute_lint_task, linter, code, offsets, view_has_changed)
+        executor = partial(modify_thread_name, task_name, task)
+        tasks.append(executor)
+
+    if len(tasks) > 3:
+        logger.warning(
+            "'{}' puts {} {} tasks on the queue."
+            .format(short_canonical_filename(view), len(tasks), linter_.name)
+        )
+    return tasks
+
+
+def create_n_independent_linters(linter, n):
+    return (
+        [linter]
+        if n == 1
+        else [clone_linter(linter) for _ in range(n)]
+    )
+
+
+def clone_linter(linter):
+    # type: (linter_module.Linter) -> linter_module.Linter
+    return linter.__class__(linter.view, linter.settings.clone())
+
+
+def short_canonical_filename(view):
+    return (
+        os.path.basename(view.file_name())
+        if view.file_name()
+        else '<untitled {}>'.format(view.buffer_id())
+    )
 
 
 def make_good_task_name(linter, view):
     with counter_lock:
         task_number = next(task_count)
 
-    canonical_filename = (
-        os.path.basename(view.file_name()) if view.file_name()
-        else '<untitled {}>'.format(view.buffer_id()))
-
+    canonical_filename = short_canonical_filename(view)
     return 'LintTask|{}|{}|{}|{}'.format(
         task_number, linter.name, canonical_filename, view.id())
 
@@ -93,27 +151,24 @@ def modify_thread_name(name, sink):
         threading.current_thread().name = original_name
 
 
-@contextmanager
-def reduced_concurrency():
-    start_time = time.time()
-    with process_limit:
-        end_time = time.time()
-        waittime = end_time - start_time
-        if waittime > 0.1:
-            logger.warning('Waited in queue for {:.2f}s'.format(waittime))
-
-        yield
-
-
-@reduced_concurrency()
 def execute_lint_task(linter, code, offsets, view_has_changed):
+    # type: (Linter, str, Tuple, Callable[[], bool]) -> LintResult
     try:
-        errors = linter.lint(code, view_has_changed) or []
+        errors = linter.lint(code, view_has_changed)
         finalize_errors(linter, errors, offsets)
-
         return errors
     except linter_module.TransientError:
-        raise  # Raise here to abort in `await_futures` below
+        # For `TransientError`s we want to omit calling the `sink` at all.
+        # Usually achieved by a `return None` (see: `run_tasks`). Here we
+        # throw to abort all other tasks submitted (see: `run_concurrently`).
+        # It's a bit stinky but good enough for our purpose.
+        # Note that `run_concurrently` turns the whole result into a `None`,
+        # making in turn the `result is None` check in `run_tasks` trivial.
+        # If we were to return a `None` just here, we had to check
+        # `None in result` instead. ¯\_(ツ)_/¯
+        raise
+    except linter_module.PermanentError:
+        return []  # Empty list here to clear old errors
     except Exception:
         linter.notify_failure()
         # Log while multi-threaded to get a nicer log message
@@ -130,6 +185,7 @@ def error_json_serializer(o):
 
 
 def finalize_errors(linter, errors, offsets):
+    # type: (Linter, List[LintError], Tuple[int, ...]) -> None
     linter_name = linter.name
     view = linter.view
     line_offset, col_offset, pt_offset = offsets
@@ -180,6 +236,7 @@ def finalize_errors(linter, errors, offsets):
 
 
 def get_lint_regions(linters, view):
+    # type: (List[Linter], sublime.View) -> Iterator[Tuple[Linter, List[sublime.Region]]]
     syntax = util.get_syntax(view)
     for linter in linters:
         settings = linter.get_view_settings()
@@ -211,6 +268,7 @@ def get_lint_regions(linters, view):
 
 
 def get_selectors(linter, wanted_syntax):
+    # type: (Linter, str) -> Iterator[str]
     for syntax in [wanted_syntax, WILDCARD_SYNTAX]:
         try:
             yield linter.selectors[syntax]
@@ -218,18 +276,18 @@ def get_selectors(linter, wanted_syntax):
             pass
 
 
-def run_concurrently(tasks, max_workers=MAX_CONCURRENT_TASKS):
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        work = [executor.submit(task) for task in tasks]
-        return await_futures(work)
+def run_concurrently(tasks, executor):
+    # type: (List[Task[T]], ThreadPoolExecutor) -> Optional[List[T]]
+    work = [executor.submit(task) for task in tasks]
+    done, not_done = wait(work, return_when=FIRST_EXCEPTION)
 
-
-def await_futures(fs):
-    done, not_done = wait(fs, return_when=FIRST_EXCEPTION)
+    for future in not_done:
+        future.cancel()
 
     try:
         return [future.result() for future in done]
     except Exception:
-        for future in not_done:
-            future.cancel()
+        # The catch-all will obviously catch any expections coming from the
+        # actual task/future. But it will also catch 'CancelledError's from
+        # the executor machinery.
         return None
