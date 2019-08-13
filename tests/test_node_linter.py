@@ -40,7 +40,7 @@ class TestNodeLinters(DeferrableTestCase):
         s.set("close_windows_when_empty", False)
 
         # it's just faster if we mock this out
-        when(linter_module.LinterMeta).register_linter(...).thenReturn(None)
+        when(linter_module).register_linter(...).thenReturn(None)
 
     @classmethod
     def tearDownClass(cls):
@@ -237,6 +237,24 @@ class TestNodeLinters(DeferrableTestCase):
         verify(node_linter.logger).warning(...)
         verify(linter).notify_failure()
 
+    @p.expand([
+        ({'bin': {'cli': 'fake.js'}},),
+        ({'bin': 'otherthing.js'},),
+    ])
+    def test_ignore_if_bin_does_not_contain_valid_information(self, CONTENT):
+        ROOT_DIR = '/p'
+        PRESENT_PACKAGE_FILE = os.path.join(ROOT_DIR, 'package.json')
+        when(self.view).file_name().thenReturn('/p/a/f.js')
+        exists = os.path.exists
+        when(os.path).exists(...).thenAnswer(exists)
+        when(os.path).exists(PRESENT_PACKAGE_FILE).thenReturn(True)
+        when(node_linter).read_json_file(PRESENT_PACKAGE_FILE).thenReturn(CONTENT)
+        when(util).which(...).thenReturn('fake.exe')
+
+        linter = make_fake_linter(self.view)
+        cmd = linter.get_cmd()
+        self.assertEqual(cmd, ['fake.exe'])
+
     def test_disable_if_not_dependency(self):
         linter = make_fake_linter(self.view)
         linter.settings['disable_if_not_dependency'] = True
@@ -263,8 +281,10 @@ class TestNodeLinters(DeferrableTestCase):
         view_has_changed = lambda: False
         sink = mock()
         when(sink).__call__(...).thenReturn(None)
-        backend.lint_view([linter], self.view, view_has_changed, sink)
+        backend.lint_view(
+            [{'name': linter.name, 'klass': linter.__class__, 'settings': linter.settings}],
+            self.view, view_has_changed, sink)
 
         yield AWAIT_WORKER
 
-        verify(sink).__call__(linter, [])
+        verify(sink).__call__(linter.name, [])

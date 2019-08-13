@@ -1,6 +1,9 @@
 from collections import ChainMap, Mapping, Sequence
 from contextlib import contextmanager
 from fnmatch import fnmatch
+from functools import lru_cache
+import inspect
+from itertools import chain
 import logging
 import os
 import re
@@ -15,8 +18,13 @@ from .const import WARNING, ERROR
 
 MYPY = False
 if MYPY:
-    from typing import Any, Callable, Dict, List, Match, Optional, Tuple, Union
+    from typing import (
+        Any, Callable, Dict, List, IO, Iterator, Match, MutableMapping,
+        Optional, Pattern, Tuple, Type, Union
+    )
     from .persist import LintError
+
+    Reason = str
 
 
 logger = logging.getLogger(__name__)
@@ -35,19 +43,19 @@ UTF8_ENV_VARS = {
     'LANG': 'en_US.UTF-8',
     'LC_CTYPE': 'en_US.UTF-8',
 }
+BASE_LINT_ENVIRONMENT = ChainMap(UTF8_ENV_VARS, os.environ)
 
-# _ACCEPTABLE_REASONS_MAP defines a list of acceptable reasons
+# ACCEPTED_REASONS_PER_MODE defines a list of acceptable reasons
 # for each lint_mode. It aims to provide a better visibility to
 # how lint_mode is implemented. The map is supposed to be used in
 # this module only.
-_ACCEPTABLE_REASONS_MAP = {
+ACCEPTED_REASONS_PER_MODE = {
     "manual": ("on_user_request",),
     "save": ("on_user_request", "on_save"),
     "load_save": ("on_user_request", "on_save", "on_load"),
-    "background": ("on_user_request", "on_save", "on_load", None),
-}
-
-BASE_LINT_ENVIRONMENT = ChainMap(UTF8_ENV_VARS, os.environ)
+    "background": ("on_user_request", "on_save", "on_load", 'on_modified'),
+}  # type: Dict[str, Tuple[str, ...]]
+KNOWN_REASONS = set(chain(*ACCEPTED_REASONS_PER_MODE.values()))
 
 LEGACY_LINT_MATCH_DEF = ("match", "line", "col", "error", "warning", "message", "near")
 COMMON_CAPTURING_NAMES = ("filename", "error_type", "code") + LEGACY_LINT_MATCH_DEF
@@ -209,13 +217,14 @@ class LinterSettings:
     """
 
     def __init__(self, raw_settings, context, _computed_settings=None):
-        # type: (Mapping[str, Any], Mapping[str, str], Mapping[str, Any]) -> None
+        # type: (Mapping[str, Any], Mapping[str, str], MutableMapping[str, Any]) -> None
         self.raw_settings = raw_settings
         self.context = context
 
         self._computed_settings = {} if _computed_settings is None else _computed_settings
 
     def __getitem__(self, key):
+        # type: (str) -> Any
         try:
             return self._computed_settings[key]
         except KeyError:
@@ -229,12 +238,15 @@ class LinterSettings:
                 return final_value
 
     def get(self, key, default=None):
+        # type: (str, Any) -> Any
         return self[key] if key in self else default
 
     def __contains__(self, key):
+        # type: (str) -> bool
         return key in self._computed_settings or key in self.raw_settings
 
     def __setitem__(self, key, value):
+        # type: (str, Any) -> None
         self._computed_settings[key] = value
 
     has = __contains__
@@ -244,12 +256,49 @@ class LinterSettings:
         # type: () -> LinterSettings
         return self.__class__(
             self.raw_settings,
-            self.context,
+            # Dirt-alert: We clone here bc we extract this context-object
+            # in `Linter.__init__`. In the scope of a linter instance,
+            # `self.context == self.settings.context` must hold.
+            ChainMap({}, self.context),
             ChainMap({}, self._computed_settings)
         )
 
 
+def substitute_variables(variables, value):
+    # type: (Mapping, Any) -> Any
+    # Utilizes Sublime Text's `expand_variables` API, which uses the
+    # `${varname}` syntax and supports placeholders (`${varname:placeholder}`).
+
+    if isinstance(value, str):
+        # Workaround https://github.com/SublimeTextIssues/Core/issues/1878
+        # (E.g. UNC paths on Windows start with double slashes.)
+        value = value.replace(r'\\', r'\\\\')
+        value = sublime.expand_variables(value, variables)
+        return os.path.expanduser(value)
+    elif isinstance(value, Mapping):
+        return {key: substitute_variables(variables, val)
+                for key, val in value.items()}
+    elif isinstance(value, Sequence):
+        return [substitute_variables(variables, item)
+                for item in value]
+    else:
+        return value
+
+
+def get_linter_settings(linter, view, context=None):
+    # type: (Type[Linter], sublime.View, Optional[Mapping[str, str]]) -> LinterSettings
+    """Return 'final' linter settings with all variables expanded."""
+    if context is None:
+        context = get_view_context(view)
+    else:
+        context = ChainMap({}, context)
+
+    settings = get_raw_linter_settings(linter, view)
+    return LinterSettings(settings, context)
+
+
 def get_raw_linter_settings(linter, view):
+    # type: (Type[Linter], sublime.View) -> MutableMapping[str, Any]
     """Return 'raw' linter settings without variables substituted.
 
     Settings are merged in the following order:
@@ -259,15 +308,12 @@ def get_raw_linter_settings(linter, view):
     project settings
     view settings
     """
-    # Note: linter can be a linter class or a linter instance
-
     defaults = linter.defaults or {}
     user_settings = persist.settings.get('linters', {}).get(linter.name, {})
 
     # We actually don't want to lint detached views, so failing here
     # when there is no window would be more appropriate, but also less
-    # convenient. See `get_linters_for_view` where we check once for detached
-    # views, and actually abort the lint job.
+    # convenient.
     window = view.window()
     if window:
         data = window.project_data() or {}
@@ -280,41 +326,14 @@ def get_raw_linter_settings(linter, view):
         project_settings = {}
 
     view_settings = ViewSettings(
-        view, 'SublimeLinter.linters.{}.'.format(linter.name))
+        view, 'SublimeLinter.linters.{}.'.format(linter.name)
+    )  # type: Mapping[str, Any]  # type: ignore
 
     return ChainMap({}, view_settings, project_settings, user_settings, defaults)
 
 
-def get_linter_settings(linter, view):
-    """Return 'final' linter settings with all variables expanded."""
-    # Note: linter can be a linter class or a linter instance
-    settings = get_raw_linter_settings(linter, view)
-    context = get_view_context(view)
-    return LinterSettings(settings, context)
-
-
-def guess_project_root_of_view(view):
-    window = view.window()
-    if not window:
-        return None
-
-    folders = window.folders()
-    if not folders:
-        return None
-
-    filename = view.file_name()
-    if not filename:
-        return folders[0]
-
-    for folder in folders:
-        # Take the first one; should we take the deepest one? The shortest?
-        if filename.startswith(folder + os.path.sep):
-            return folder
-
-    return None
-
-
-def get_view_context(view):
+def get_view_context(view, additional_context=None):
+    # type: (sublime.View, Optional[Mapping]) -> MutableMapping[str, str]
     # Note that we ship a enhanced version for 'folder' if you have multiple
     # folders open in a window. See `guess_project_root_of_view`.
 
@@ -341,27 +360,31 @@ def get_view_context(view):
         context['file_base_name'] = file_base_name
         context['file_extension'] = file_extension
 
+    if additional_context:
+        context.update(additional_context)
+
     return context
 
 
-def substitute_variables(variables, value):
-    # Utilizes Sublime Text's `expand_variables` API, which uses the
-    # `${varname}` syntax and supports placeholders (`${varname:placeholder}`).
+def guess_project_root_of_view(view):
+    window = view.window()
+    if not window:
+        return None
 
-    if isinstance(value, str):
-        # Workaround https://github.com/SublimeTextIssues/Core/issues/1878
-        # (E.g. UNC paths on Windows start with double slashes.)
-        value = value.replace(r'\\', r'\\\\')
-        value = sublime.expand_variables(value, variables)
-        return os.path.expanduser(value)
-    elif isinstance(value, Mapping):
-        return {key: substitute_variables(variables, val)
-                for key, val in value.items()}
-    elif isinstance(value, Sequence):
-        return [substitute_variables(variables, item)
-                for item in value]
-    else:
-        return value
+    folders = window.folders()
+    if not folders:
+        return None
+
+    filename = view.file_name()
+    if not filename:
+        return folders[0]
+
+    for folder in folders:
+        # Take the first one; should we take the deepest one? The shortest?
+        if os.path.commonprefix([folder, filename]) == folder:
+            return folder
+
+    return None
 
 
 class LinterMeta(type):
@@ -393,17 +416,20 @@ class LinterMeta(type):
         # BEGIN DEPRECATIONS
         for key in ('syntax', 'selectors'):
             if key in attrs:
-                logger.warning(
-                    "{}: Defining 'cls.{}' has been deprecated. Use "
-                    "http://www.sublimelinter.com/en/stable/linter_settings.html#selector"
+                logger.error(
+                    "{}: Defining 'cls.{}' has no effect anymore. Use "
+                    "http://www.sublimelinter.com/en/stable/linter_settings.html#selector "
+                    "instead."
                     .format(name, key)
                 )
+                cls.disabled = True
 
         for key in (
             'version_args', 'version_re', 'version_requirement',
             'inline_settings', 'inline_overrides',
             'comment_re', 'shebang_match',
-            'npm_name', 'composer_name'
+            'npm_name', 'composer_name',
+            'executable', 'executable_path'
         ):
             if key in attrs:
                 logger.warning(
@@ -422,75 +448,110 @@ class LinterMeta(type):
                     "{}: Implementing 'cls.{}' has no effect anymore. You "
                     "can safely remove these methods.".format(name, key))
 
-        if 'should_lint' in attrs:
-            logger.warning(
-                "{}: Do *NOT* implement 'should_lint'. SublimeLinter will "
-                "have a breaking change here in the near future.  "
-                "Note: The 'self' you see in there is probably not the "
-                "same 'self' you see in other methods. Do *not* mutate 'self'!"
+        if (
+            'should_lint' in attrs
+            and not isinstance(attrs['should_lint'], classmethod)
+        ):
+            logger.error(
+                "{} disabled. 'should_lint' now is a `@classmethod` and has a "
+                "different call signature. \nYou need to adapt the plugin code "
+                "because as it is the linter cannot run and thus will be "
+                "disabled.  :-( \n\n"
+                "(Extending 'should_lint' is an edge-case and you probably don't "
+                "even need it, but if you do look it up \nin the source code on "
+                "GitHub.)"
                 .format(name))
+            cls.disabled = True
+
+        if (
+            'get_environment' in attrs
+            and not len(inspect.getfullargspec(attrs['get_environment']).args) == 1
+        ):
+            logger.error(
+                "{} disabled. 'get_environment' now has a simplified signature:\n"
+                "    def get_environment(self): ...\n"
+                "The settings object can be retrieved via `self.settings`.\n"
+                "You need to update the linter plugin because as it is the "
+                "linter cannot run and thus will be disabled.  :-("
+                .format(name))
+            cls.disabled = True
+
+        if (
+            'get_working_dir' in attrs
+            and not len(inspect.getfullargspec(attrs['get_working_dir']).args) == 1
+        ):
+            logger.error(
+                "{} disabled. 'get_working_dir' now has a simplified signature:\n"
+                "    def get_working_dir(self): ...\n"
+                "The settings object can be retrieved via `self.settings`.\n"
+                "You need to update the linter plugin because as it is the "
+                "linter cannot run and thus will be disabled.  :-("
+                .format(name))
+            cls.disabled = True
         # END DEPRECATIONS
 
+        # BEGIN CLASS MUTATIONS
         cmd = attrs.get('cmd')
-
         if isinstance(cmd, str):
             setattr(cls, 'cmd', shlex.split(cmd))
 
-        syntax = attrs.get('syntax')
+        if attrs.get('multiline', False):
+            cls.re_flags |= re.MULTILINE
 
-        try:
-            if isinstance(syntax, str) and syntax[0] == '^':
-                setattr(cls, 'syntax', re.compile(syntax))
-        except re.error as err:
-            logger.error(
-                '{} disabled, error compiling syntax: {}'
-                .format(name, str(err))
-            )
-            setattr(cls, 'disabled', True)
+        for regex in ('regex', 'word_re'):
+            attr = attrs.get(regex)
 
-        if not cls.disabled:
-            for regex in ('regex', 'word_re'):
-                attr = getattr(cls, regex)
-
-                if isinstance(attr, str):
-                    if regex == 'regex' and cls.multiline:
-                        setattr(cls, 're_flags', cls.re_flags | re.MULTILINE)
-
-                    try:
-                        setattr(cls, regex, re.compile(attr, cls.re_flags))
-                    except re.error as err:
-                        logger.error(
-                            '{} disabled, error compiling {}: {}'
-                            .format(name, regex, str(err))
-                        )
-                        setattr(cls, 'disabled', True)
-
-        if not cls.disabled:
-            if (cls.cmd is not None and not cls.cmd) or not cls.regex:
-                logger.error('{} disabled, not fully implemented'.format(name))
-                setattr(cls, 'disabled', True)
+            if isinstance(attr, str):
+                try:
+                    setattr(cls, regex, re.compile(attr, cls.re_flags))
+                except re.error as err:
+                    logger.error(
+                        '{} disabled, error compiling {}: {}.'
+                        .format(name, regex, str(err))
+                    )
+                    cls.disabled = True
+                else:
+                    if regex == 'regex' and cls.regex.flags & re.M == re.M:
+                        cls.multiline = True
 
         # If this class has its own defaults, create an args_map.
-        # Otherwise we use the superclass' args_map.
-        if 'defaults' in attrs and attrs['defaults']:
+        defaults = attrs.get('defaults', None)
+        if defaults and isinstance(defaults, dict):
             cls.map_args(attrs['defaults'])
+        # END CLASS MUTATIONS
 
-        if not cls.syntax and 'selector' not in cls.defaults:
+        # BEGIN VALIDATION
+        if not cls.cmd and cls.cmd is not None:
             logger.error(
-                "{} disabled, either 'syntax' or 'selector' must be specified"
-                .format(name))
-            setattr(cls, 'disabled', True)
+                "{} disabled, 'cmd' must be specified."
+                .format(name)
+            )
+            cls.disabled = True
 
-        cls.register_linter(name)
+        if not isinstance(cls.defaults, dict):
+            logger.error(
+                "{} disabled. 'cls.defaults' is mandatory and MUST be a dict."
+                .format(name)
+            )
+            cls.disabled = True
+        elif 'selector' not in cls.defaults:
+            if 'defaults' not in attrs:
+                logger.error(
+                    "{} disabled. 'cls.defaults' is mandatory and MUST be a dict."
+                    .format(name)
+                )
+            else:
+                logger.error(
+                    "{} disabled. 'selector' is mandatory in 'cls.defaults'.\n See "
+                    "http://www.sublimelinter.com/en/stable/linter_settings.html#selector"
+                    .format(name))
+            cls.disabled = True
+        # END VALIDATION
 
-    def register_linter(cls, name):
-        """Add a linter class to our mapping of class names <-> linter classes."""
-        persist.linter_classes[name] = cls
+        if cls.disabled:
+            return
 
-        # The sublime plugin API is not available until plugin_loaded is executed
-        if persist.api_ready:
-            sublime.run_command('sublime_linter_config_changed')
-            logger.info('{} linter reloaded'.format(name))
+        register_linter(name, cls)
 
     def map_args(cls, defaults):
         """
@@ -518,6 +579,23 @@ class LinterMeta(type):
         setattr(cls, 'args_map', args_map)
 
 
+def register_linter(name, cls):
+    """Add a linter class to our mapping of class names <-> linter classes."""
+    persist.linter_classes[name] = cls
+
+    # Trigger a re-lint if SublimeLinter is already up and running. On Sublime
+    # start, this is generally not necessary, because SL will trigger various
+    # synthetic `on_activated_async` events on load.
+    if persist.api_ready:
+        sublime.run_command('sublime_linter_config_changed')
+        logger.info('{} linter reloaded'.format(name))
+
+
+@lru_cache(4)
+def deprecation_warning(msg):
+    logger.warning(msg)
+
+
 class Linter(metaclass=LinterMeta):
     """
     The base class for linters.
@@ -531,25 +609,17 @@ class Linter(metaclass=LinterMeta):
     #
     name = ''
 
-    # The syntax that the linter handles. May be a string or
-    # list/tuple of strings. Names should be all lowercase.
-    syntax = ''
-
     # A string, list, tuple or callable that returns a string, list or tuple, containing the
     # command line (with arguments) used to lint.
-    cmd = ''
-
-    # DEPRECATED: Will not be evaluated. They stay here so that old plugins
-    # do not throw an AttributeError, but they will always be None
-    executable = None
-    executable_path = None
+    cmd = ''  # type: Union[None, str, List[str], Tuple[str, ...]]
 
     # A regex pattern used to extract information from the executable's output.
-    regex = ''
+    regex = None  # type: Union[None, str, Pattern]
 
     # Set to True if the linter outputs multiline error messages. When True,
-    # regex will be created with the re.MULTILINE flag. Do NOT rely on setting
-    # the re.MULTILINE flag within the regex yourself, this attribute must be set.
+    # regex will be created with the re.MULTILINE flag. If instead, you set
+    # the re.MULTILINE flag within the regex yourself, we in turn set this attribute
+    # to True automatically.
     multiline = False
 
     # If you want to set flags on the regex *other* than re.MULTILINE, set this.
@@ -578,7 +648,7 @@ class Linter(metaclass=LinterMeta):
     # to a temp directory (e.g. javac). In such cases, set this attribute to '-',
     # which marks the linter as "file-only". That will disable the linter for
     # any views that are dirty.
-    tempfile_suffix = None
+    tempfile_suffix = None  # type: Union[None, str, Dict[str, str]]
 
     # Linters may output to both stdout and stderr. By default stdout and sterr are captured.
     # If a linter will never output anything useful on a stream (including when
@@ -588,16 +658,6 @@ class Linter(metaclass=LinterMeta):
 
     # Tab width
     tab_width = 1
-
-    # If a linter can be used with embedded code, you need to tell SublimeLinter
-    # which portions of the source code contain the embedded code by specifying
-    # the embedded scope selectors. This attribute maps syntax names
-    # to embedded scope selectors.
-    #
-    # For example, the HTML syntax uses the scope `source.js.embedded.html`
-    # for embedded JavaScript. To allow a JavaScript linter to lint that embedded
-    # JavaScript, you would set this attribute to {'html': 'source.js.embedded.html'}.
-    selectors = {}
 
     # If a linter reports a column position, SublimeLinter highlights the nearest
     # word at that point. You can customize the regex used to highlight words
@@ -625,16 +685,19 @@ class Linter(metaclass=LinterMeta):
     #
     # After the format is parsed, the prefix and suffix are removed and the
     # setting is replaced with <name>.
-    defaults = None
+    defaults = {}  # type: Dict[str, Any]
 
     # `disabled` has three states (None, True, False). It takes precedence
     # over all other user or project settings.
-    disabled = None
+    disabled = None  # type: Union[None, bool]
 
     def __init__(self, view, settings):
         # type: (sublime.View, LinterSettings) -> None
         self.view = view
         self.settings = settings
+        # Simplify tests which often just pass in a dict instead of
+        # real `LinterSettings`.
+        self.context = getattr(settings, 'context', {})  # type: MutableMapping[str, str]
         # Using `self.env` is deprecated, bc it can have surprising
         # side-effects for concurrent/async linting. We initialize it here
         # bc some ruby linters rely on that behavior.
@@ -645,21 +708,27 @@ class Linter(metaclass=LinterMeta):
         if self.defaults is not None:
             self.defaults = self.defaults.copy()
 
-        self.temp_filename = None
-
     @property
     def filename(self):
+        # type: () -> str
         """Return the view's file path or '' if unsaved."""
         return self.view.file_name() or ''
 
     @property
     def executable_path(self):
-        logger.info(
-            "'executable_path' has been deprecated. "
-            "Just use an ordinary binary name instead. ")
-        return self.executable
+        deprecation_warning(
+            "{}: `executable_path` has been deprecated. "
+            "Just use an ordinary binary name instead. "
+            .format(self.name)
+        )
+        return getattr(self, 'executable', '')
 
     def get_view_settings(self):
+        deprecation_warning(
+            "{}: `self.get_view_settings()` has been deprecated.  "
+            "Just use the member `self.settings` which is the same thing."
+            .format(self.name)
+        )
         return self.settings
 
     def notify_failure(self):
@@ -697,6 +766,7 @@ class Linter(metaclass=LinterMeta):
         return util.which(cmd)
 
     def get_cmd(self):
+        # type: () -> Optional[List[str]]
         """
         Calculate and return a tuple/list of the command line to be executed.
 
@@ -706,8 +776,9 @@ class Linter(metaclass=LinterMeta):
 
         Otherwise the result of build_cmd is returned.
         """
-        cmd = self.cmd
+        assert self.cmd is not None
 
+        cmd = self.cmd
         if callable(cmd):
             cmd = cmd()
 
@@ -716,19 +787,10 @@ class Linter(metaclass=LinterMeta):
         else:
             cmd = list(cmd)
 
-        # For backwards compatibility: SL3 allowed a '@python' suffix which,
-        # when set, triggered special handling. SL4 doesn't need this marker,
-        # bc all the special handling is just done in the subclass.
-        which = cmd[0]
-        if '@python' in which:
-            logger.warning(
-                "The '@python' in '{}' has been deprecated and no effect "
-                "anymore. You can safely remove it.".format(which))
-            cmd[0] = which[:which.find('@python')]
-
         return self.build_cmd(cmd)
 
     def build_cmd(self, cmd):
+        # type: (List[str]) -> Optional[List[str]]
         """
         Return a tuple with the command line to execute.
 
@@ -779,8 +841,7 @@ class Linter(metaclass=LinterMeta):
         Notable: `<path>` can be a list/tuple or str
 
         """
-        settings = self.get_view_settings()
-        executable = settings.get('executable', None)
+        executable = self.settings.get('executable', None)
         if executable:
             logger.info(
                 "{}: wanted executable is '{}'".format(self.name, executable)
@@ -800,9 +861,9 @@ class Linter(metaclass=LinterMeta):
         return False, None
 
     def insert_args(self, cmd):
+        # type: (List[str]) -> List[str]
         """Insert user arguments into cmd and return the result."""
-        settings = self.get_view_settings()
-        args = self.build_args(settings)
+        args = self.build_args(self.settings)
 
         if '${args}' in cmd:
             i = cmd.index('${args}')
@@ -816,6 +877,7 @@ class Linter(metaclass=LinterMeta):
         return cmd
 
     def get_user_args(self, settings):
+        # type: (LinterSettings) -> List[str]
         """Return any args the user specifies in settings as a list."""
         args = settings.get('args', [])
 
@@ -827,6 +889,7 @@ class Linter(metaclass=LinterMeta):
         return args
 
     def build_args(self, settings):
+        # type: (LinterSettings) -> List[str]
         """Return a list of args to add to cls.cmd.
 
         This basically implements our DSL around arguments on the command
@@ -881,33 +944,47 @@ class Linter(metaclass=LinterMeta):
 
         return args
 
-    def get_working_dir(self, settings):
-        # type: (LinterSettings) -> Optional[str]
+    def get_working_dir(self, settings=None):
+        # type: (...) -> Optional[str]
         """Return the working dir for this lint."""
-        cwd = settings.get('working_dir', None)
+        if settings is not None:
+            deprecation_warning(
+                "{}: Passing a `settings` object down to `get_working_dir` "
+                "has been deprecated and no effect anymore.  "
+                "Just use `self.get_working_dir()`."
+                .format(self.name)
+            )
 
+        cwd = self.settings.get('working_dir', None)
         if cwd:
             if os.path.isdir(cwd):
                 return cwd
             else:
                 logger.error(
                     "{}: wanted working_dir '{}' is not a directory"
-                    "".format(self.name, cwd)
+                    .format(self.name, cwd)
                 )
                 return None
 
-        filename = self.view.file_name()
-        return (
-            guess_project_root_of_view(self.view) or
-            (os.path.dirname(filename) if filename else None)
-        )
+        return self.context.get('folder') or self.context.get('file_path')
 
-    def get_environment(self, settings):
+    def get_environment(self, settings=None):
+        # type: (...) -> ChainMap
         """Return runtime environment for this lint."""
-        return ChainMap({}, settings.get('env', {}), self.env, BASE_LINT_ENVIRONMENT)
+        if settings is not None:
+            deprecation_warning(
+                "{}: Passing a `settings` object down to `get_environment` "
+                "has been deprecated and no effect anymore.  "
+                "Just use `self.get_environment()`."
+                .format(self.name)
+            )
+
+        return ChainMap({}, self.settings.get('env', {}), self.env, BASE_LINT_ENVIRONMENT)
 
     @classmethod
     def can_lint_view(cls, view, settings):
+        # type: (sublime.View, LinterSettings) -> bool
+        """Decide wheter the linter is applicable to given view."""
         if cls.disabled is True:
             return False
 
@@ -917,8 +994,7 @@ class Linter(metaclass=LinterMeta):
         if not cls.matches_selector(view, settings):
             return False
 
-        filename = view.file_name()
-        filename = os.path.realpath(filename) if filename else '<untitled>'
+        filename = view.file_name() or '<untitled>'
         excludes = util.convert_type(settings.get('excludes', []), [])
         if excludes:
             for pattern in excludes:
@@ -938,6 +1014,7 @@ class Linter(metaclass=LinterMeta):
 
     @classmethod
     def matches_selector(cls, view, settings):
+        # type: (sublime.View, LinterSettings) -> bool
         selector = settings.get('selector', None)
         if selector is not None:
             return bool(
@@ -946,46 +1023,39 @@ class Linter(metaclass=LinterMeta):
                 view.score_selector(0, selector) or
                 view.find_by_selector(selector)
             )
+        return False
 
-        # Fallback using deprecated `cls.syntax`
-        syntax = util.get_syntax(view).lower()
-
-        if not syntax:
+    @classmethod
+    def should_lint(cls, view, settings, reason):
+        # type: (sublime.View, LinterSettings, Reason) -> bool
+        """Decide whether the linter can run at this point in time."""
+        # A 'saved-file-only' linter does not run on unsaved views
+        if cls.tempfile_suffix == '-' and view.is_dirty():
             return False
 
-        if cls.syntax == '*':
+        if reason not in KNOWN_REASONS:  # be open
+            logger.info(
+                "{}: Unknown reason '{}' is okay."
+                .format(cls.name, reason)
+            )
             return True
 
-        if hasattr(cls.syntax, 'match'):
-            return cls.syntax.match(syntax) is not None
-
-        syntaxes = (
-            [cls.syntax] if isinstance(cls.syntax, str)
-            else list(cls.syntax)
-        )
-        return syntax in syntaxes
-
-    def should_lint(self, reason=None):
-        """
-        should_lint takes reason then decides whether the linter should start or not.
-
-        DO NOT USE except for experiments! WILL CHANGE!
-        Note that `self` here is probably not the same `self` you later
-        see e.g. in `split_match`. Do *NOT* mutate `self`!
-        """
-        # A 'saved-file-only' linter does not run on unsaved views
-        if self.tempfile_suffix == '-' and self.view.is_dirty():
-            return False
-
         fallback_mode = persist.settings.get('lint_mode', 'background')
-        settings = self.get_view_settings()
         lint_mode = settings.get('lint_mode', fallback_mode)
-        logger.info(
-            "{}: checking lint mode '{}' vs lint reason '{}'"
-            .format(self.name, lint_mode, reason)
-        )
+        if lint_mode not in ACCEPTED_REASONS_PER_MODE:
+            logger.warning(
+                "{}: Unknown lint mode '{}'.  "
+                "Check your SublimeLinter settings for typos."
+                .format(cls.name, lint_mode)
+            )
+            return True
 
-        return reason in _ACCEPTABLE_REASONS_MAP[lint_mode]
+        ok = reason in ACCEPTED_REASONS_PER_MODE[lint_mode]
+        logger.info(
+            "{}: Checking lint mode '{}' vs lint reason '{}'.  {}"
+            .format(cls.name, lint_mode, reason, 'Ok.' if ok else 'Skip.')
+        )
+        return ok
 
     def lint(self, code, view_has_changed):
         # type: (str, Callable[[], bool]) -> List[LintError]
@@ -1005,14 +1075,14 @@ class Linter(metaclass=LinterMeta):
         # `cmd = None` is a special API signal, that the plugin author
         # implemented its own `run`
         if self.cmd is None:
-            output = self.run(None, code)     # type: str
+            output = self.run(None, code)  # type: Union[str, util.popen_output]
         else:
             cmd = self.get_cmd()
             if not cmd:  # We couldn't find an executable
                 self.notify_failure()
                 return []
 
-            output = self.run(cmd, code)  # type: util.popen_output
+            output = self.run(cmd, code)
 
         if view_has_changed():
             raise TransientError('View not consistent.')
@@ -1021,7 +1091,8 @@ class Linter(metaclass=LinterMeta):
         return self.filter_errors(self.parse_output(output, virtual_view))
 
     def filter_errors(self, errors):
-        filter_patterns = self.get_view_settings().get('filter_errors') or []
+        # type: (Iterator[LintError]) -> List[LintError]
+        filter_patterns = self.settings.get('filter_errors') or []
         if isinstance(filter_patterns, str):
             filter_patterns = [filter_patterns]
 
@@ -1044,34 +1115,36 @@ class Linter(metaclass=LinterMeta):
         return [
             error
             for error in errors
-            if error is not None and not any(
+            if not any(
                 pattern.search(': '.join([error['error_type'], error['code'], error['msg']]))
                 for pattern in filters
             )
         ]
 
     def parse_output(self, proc, virtual_view):
+        # type: (Union[str, util.popen_output], VirtualView) -> Iterator[LintError]
         # Note: We support type str for `proc`. E.g. the user might have
         # implemented `run`.
-        try:
-            output, stderr = proc.stdout, proc.stderr
-        except AttributeError:
-            output = proc
-        else:
-            # Try to handle `on_stderr`, but only for STREAM_BOTH linters
+        if isinstance(proc, util.popen_output):
+            # Split output, but only for STREAM_BOTH linters, and if
+            # `on_stderr` is defined.
             if (
-                output is not None and
-                stderr is not None and
+                proc.stdout is not None and
+                proc.stderr is not None and
                 callable(self.on_stderr)
             ):
+                output, stderr = proc.stdout, proc.stderr
                 if stderr.strip():
                     self.on_stderr(stderr)
             else:
                 output = proc.combined_output
+        else:
+            output = proc
 
         return self.parse_output_via_regex(output, virtual_view)
 
     def parse_output_via_regex(self, output, virtual_view):
+        # type: (str, VirtualView) -> Iterator[LintError]
         if not output:
             logger.info('{}: no output'.format(self.name))
             return
@@ -1089,9 +1162,12 @@ class Linter(metaclass=LinterMeta):
                 m = LintMatch(*m)
 
             if m.message and m.line is not None:
-                yield self.process_match(m, virtual_view)
+                error = self.process_match(m, virtual_view)
+                if error:
+                    yield error
 
     def find_errors(self, output):
+        # type: (str) -> Iterator[LintMatch]
         """
         Match the linter's regex against the linter output with this generator.
 
@@ -1099,6 +1175,19 @@ class Linter(metaclass=LinterMeta):
         match of self.regex. If False, split_match is called for each line
         in output.
         """
+        if not self.regex:
+            logger.error(
+                "{}: 'self.regex' is not defined.  If this is intentional "
+                "because e.g. the linter reports JSON, implement your own "
+                "'def find_errors(self, output)'."
+                .format(self.name)
+            )
+            raise PermanentError("regex not defined")
+
+        if MYPY:
+            assert isinstance(self.regex, Pattern)
+            match = None  # type: Optional[Match]
+
         if self.multiline:
             matches = list(self.regex.finditer(output))
             if not matches:
@@ -1117,7 +1206,8 @@ class Linter(metaclass=LinterMeta):
                     logger.info(
                         "{}: No match for line: '{}'".format(self.name, line))
 
-    def split_match(self, match):  # type: (Match) -> LintMatch
+    def split_match(self, match):
+        # type: (Match) -> LintMatch
         """Convert the regex match to a `LintMatch`
 
         Basically, a `LintMatch` is the dict of the named capturing groups
@@ -1168,6 +1258,7 @@ class Linter(metaclass=LinterMeta):
         return error
 
     def process_match(self, m, vv):
+        # type: (LintMatch, VirtualView) -> Optional[LintError]
         error_type = m.error_type or self.get_error_type(m.error, m.warning)
         code = m.code or m.error or m.warning or ''
 
@@ -1192,8 +1283,8 @@ class Linter(metaclass=LinterMeta):
             # use the filename of the current view
             filename = self.view.file_name() or "<untitled {}>".format(self.view.buffer_id())
 
-        col = m.col
-        line = m.line
+        line = m.line  # type: int
+        col = m.col    # type: Optional[int]
 
         # Ensure `line` is within bounds
         line = max(min(line, vv.max_lines()), 0)
@@ -1240,33 +1331,33 @@ class Linter(metaclass=LinterMeta):
             return self.default_type
 
     def normalize_filename(self, filename):
+        # type: (Optional[str]) -> Optional[str]
         """Return an absolute filename if it is not the main file."""
-        if filename and not self.is_stdin_filename(filename):
-            # ensure that the filename is absolute by basing relative paths on
-            # the working directory
-            cwd = self.get_working_dir(self.settings) or os.path.realpath('.')
+        if not filename:
+            return None
+
+        if self.is_stdin_filename(filename):
+            return None
+
+        if not os.path.isabs(filename):
+            cwd = self.get_working_dir() or os.getcwd()
             filename = os.path.normpath(os.path.join(cwd, filename))
 
-            # only return a filename if it is a different file
-            normed_filename = os.path.normcase(filename)
-            if normed_filename == os.path.normcase(self.filename):
+        # Some linters work on temp files but actually output 'real', user
+        # filenames, so we need to check both.
+        for processed_file in filter(None, (self.context.get('temp_file'), self.filename)):
+            if os.path.normcase(filename) == os.path.normcase(processed_file):
                 return None
 
-            # when the command was run on a temporary file we also need to
-            # compare this filename with that temporary filename
-            if self.temp_filename and normed_filename == os.path.normcase(self.temp_filename):
-                return None
-
-            return filename
-
-        # must be the main file
-        return None
+        return filename
 
     @staticmethod
     def is_stdin_filename(filename):
+        # type: (str) -> bool
         return filename in ["stdin", "<stdin>", "-"]
 
     def maybe_fix_tab_width(self, line, col, vv):
+        # type: (int, int, VirtualView) -> int
         # Adjust column numbers to match the linter's tabs if necessary
         if self.tab_width > 1:
             code_line = vv.select_line(line)
@@ -1282,6 +1373,7 @@ class Linter(metaclass=LinterMeta):
         return col
 
     def reposition_match(self, line, col, m, vv):
+        # type: (int, Optional[int], LintMatch, VirtualView) -> Tuple[int, int, int]
         """Chance to reposition the error.
 
         Must return a tuple (line, start, end)
@@ -1339,6 +1431,7 @@ class Linter(metaclass=LinterMeta):
 
     @staticmethod
     def strip_quotes(text):
+        # type: (str) -> str
         """Return text stripped of enclosing single/double quotes."""
         if len(text) < 2:
             return text
@@ -1351,6 +1444,10 @@ class Linter(metaclass=LinterMeta):
         return text
 
     def run(self, cmd, code):
+        # type: (Union[List[str], None], str) -> Union[util.popen_output, str]
+        # Note the type here is the interface we accept. But we only actually
+        # implement `(List[str], str) -> util.popen_output` here. Subclassers
+        # might do differently.
         """
         Execute the linter's executable or built in code and return its output.
 
@@ -1361,6 +1458,8 @@ class Linter(metaclass=LinterMeta):
         method, it will need to override this method.
 
         """
+        assert cmd is not None
+
         if self.tempfile_suffix:
             if self.tempfile_suffix != '-':
                 return self.tmpfile(cmd, code)
@@ -1372,32 +1471,30 @@ class Linter(metaclass=LinterMeta):
     # popen wrappers
 
     def communicate(self, cmd, code=None):
+        # type: (List[str], Optional[str]) -> util.popen_output
         """Run an external executable using stdin to pass code and return its output."""
-        ctx = get_view_context(self.view)
-        ctx['file_on_disk'] = self.filename
+        self.context['file_on_disk'] = self.filename
 
         cmd = self.finalize_cmd(
-            cmd, ctx, at_value=self.filename, auto_append=code is None)
+            cmd, self.context, at_value=self.filename, auto_append=code is None)
         return self._communicate(cmd, code)
 
     def tmpfile(self, cmd, code, suffix=None):
+        # type: (List[str], str, Optional[str]) -> util.popen_output
         """Create temporary file with code and lint it."""
         if suffix is None:
             suffix = self.get_tempfile_suffix()
 
         with make_temp_file(suffix, code) as file:
-            # store this filename to assign its errors to the main file later
-            self.temp_filename = file.name
-
-            ctx = get_view_context(self.view)
-            ctx['file_on_disk'] = self.filename
-            ctx['temp_file'] = file.name
+            self.context['file_on_disk'] = self.filename
+            self.context['temp_file'] = file.name
 
             cmd = self.finalize_cmd(
-                cmd, ctx, at_value=file.name, auto_append=True)
+                cmd, self.context, at_value=file.name, auto_append=True)
             return self._communicate(cmd)
 
     def finalize_cmd(self, cmd, context, at_value='', auto_append=False):
+        # type: (List[str], Mapping[str, str], str, bool) -> List[str]
         # Note: Both keyword arguments are deprecated.
         original_cmd = cmd
         cmd = substitute_variables(context, cmd)
@@ -1416,10 +1513,13 @@ class Linter(metaclass=LinterMeta):
         return cmd
 
     def get_tempfile_suffix(self):
+        # type: () -> str
         """Return a good filename suffix."""
-        if self.view.file_name():
-            name = self.view.file_name()
-            _, suffix = os.path.splitext(name)
+        assert self.tempfile_suffix
+
+        filename = self.filename
+        if filename:
+            _, suffix = os.path.splitext(filename)
 
         elif isinstance(self.tempfile_suffix, dict):
             syntax = util.get_syntax(self.view)
@@ -1441,17 +1541,15 @@ class Linter(metaclass=LinterMeta):
         return suffix
 
     def _communicate(self, cmd, code=None):
+        # type: (List[str], Optional[str]) -> util.popen_output
         """Run command and return result."""
-        settings = self.get_view_settings()
-        cwd = self.get_working_dir(settings)
-        env = self.get_environment(settings)
+        cwd = self.get_working_dir()
+        env = self.get_environment()
 
         output_stream = self.error_stream
         view = self.view
 
-        if code is not None:
-            code = code.encode('utf8')
-
+        code_b = code.encode('utf8') if code is not None else None
         uses_stdin = code is not None
         stdin = subprocess.PIPE if uses_stdin else None
         stdout = subprocess.PIPE if output_stream & util.STREAM_STDOUT else None
@@ -1471,7 +1569,7 @@ class Linter(metaclass=LinterMeta):
                 cmd, uses_stdin, cwd, view, augmented_env))
 
             self.notify_failure()
-            return ''
+            raise PermanentError("popen constructor failed")
 
         if logger.isEnabledFor(logging.INFO):
             logger.info(make_nice_log_message(
@@ -1480,7 +1578,7 @@ class Linter(metaclass=LinterMeta):
         bid = view.buffer_id()
         with store_proc_while_running(bid, proc):
             try:
-                out = proc.communicate(code)
+                out = proc.communicate(code_b)
 
             except BrokenPipeError as err:
                 friendly_terminated = getattr(proc, 'friendly_terminated', False)
@@ -1491,7 +1589,7 @@ class Linter(metaclass=LinterMeta):
                 else:
                     logger.warning('Exception: {}'.format(str(err)))
                     self.notify_failure()
-                    return ''
+                    raise PermanentError("non-friendly broken pipe")
 
             except OSError as err:
                 # There are rare reports of '[Errno 9] Bad file descriptor'.
@@ -1514,6 +1612,7 @@ class Linter(metaclass=LinterMeta):
 
 @contextmanager
 def make_temp_file(suffix, code):
+    # type: (str, str) -> Iterator[IO]
     file = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
     try:
         file.write(bytes(code, 'UTF-8'))
@@ -1526,6 +1625,7 @@ def make_temp_file(suffix, code):
 
 @contextmanager
 def store_proc_while_running(bid, proc):
+    # type: (sublime.BufferId, subprocess.Popen) -> Iterator[subprocess.Popen]
     with persist.active_procs_lock:
         persist.active_procs[bid].append(proc)
 
@@ -1559,6 +1659,7 @@ ENV_TEMPLATE = """
 
 def make_nice_log_message(headline, cmd, is_stdin,
                           cwd, view, env=None):
+    # type: (str, List[str], bool, Optional[str], sublime.View, Optional[Dict[str, str]]) -> str
     import pprint
     import textwrap
 
@@ -1568,12 +1669,10 @@ def make_nice_log_message(headline, cmd, is_stdin,
     elif not filename:
         rel_filename = '<buffer {}>'.format(view.buffer_id())
 
-    real_cwd = cwd if cwd else os.path.realpath(os.path.curdir)
-
     on_win = os.name == 'nt'
     exec_msg = RUNNING_TEMPLATE.format(
         headline=headline,
-        cwd=real_cwd,
+        cwd=cwd or os.getcwd(),
         prompt='>' if on_win else '$',
         pipe=PIPE_TEMPLATE.format(rel_filename) if is_stdin else '',
         cmd=subprocess.list2cmdline(cmd) if on_win else ' '.join(cmd)

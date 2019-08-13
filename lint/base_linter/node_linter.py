@@ -82,7 +82,7 @@ class NodeLinter(linter.Linter):
             if local_cmd:
                 return True, local_cmd
 
-        if self.get_view_settings().get('disable_if_not_dependency', False):
+        if self.settings.get('disable_if_not_dependency', False):
             logger.info(
                 "Skipping '{}' since it is not installed locally.\n"
                 "You can change this behavior by setting 'disable_if_not_dependency' to 'false'."
@@ -96,8 +96,8 @@ class NodeLinter(linter.Linter):
     def get_start_dir(self):
         # type: () -> Optional[str]
         return (
-            self.settings.context.get('file_path') or
-            self.get_working_dir(self.settings)
+            self.context.get('file_path') or
+            self.get_working_dir()
         )
 
     def find_local_executable(self, start_dir, npm_name):
@@ -124,7 +124,7 @@ class NodeLinter(linter.Linter):
                 # but must run as a normal script. E.g. `/usr/bin/env node eslint.js`
                 try:
                     script = os.path.normpath(os.path.join(path, manifest['bin'][npm_name]))
-                except KeyError:
+                except (KeyError, TypeError):
                     pass
                 else:
                     if not os.path.exists(os.path.join(path, 'node_modules', '.bin')):
