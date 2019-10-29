@@ -3,7 +3,7 @@ import traceback
 
 
 LINT_START = 'LINT_START'    # (buffer_id)
-LINT_RESULT = 'LINT_RESULT'  # (buffer_id, linter_name, errors)
+LINT_RESULT = 'LINT_RESULT'  # (filename, linter_name, errors)
 LINT_END = 'LINT_END'        # (buffer_id)
 
 
@@ -21,8 +21,7 @@ def unsubscribe(topic, fn):
         pass
 
 
-def broadcast(topic, message=None):
-    payload = message.copy() or {}
+def broadcast(topic, payload={}):
     for fn in listeners.get(topic, []):
         try:
             fn(**payload)

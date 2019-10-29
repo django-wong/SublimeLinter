@@ -158,6 +158,9 @@ class VirtualView:
     def max_lines(self):
         return len(self._newlines) - 2
 
+    def substr(self, region):
+        return self._code[region.begin():region.end()]
+
     # Actual Sublime API would look like:
     # def full_line(self, region)
     # def full_line(self, point) => Region
@@ -167,9 +170,16 @@ class VirtualView:
 
     @staticmethod
     def from_file(filename):
+        # type: (str) -> VirtualView
         """Return a VirtualView with the contents of file."""
-        with open(filename, 'r', encoding='utf8') as f:
-            return VirtualView(f.read())
+        return _virtual_view_from_file(filename, os.path.getmtime(filename))
+
+
+@lru_cache(maxsize=128)
+def _virtual_view_from_file(filename, mtime):
+    # type: (str, float) -> VirtualView
+    with open(filename, 'r', encoding='utf8') as f:
+        return VirtualView(f.read())
 
 
 class ViewSettings:
@@ -299,15 +309,7 @@ def get_linter_settings(linter, view, context=None):
 
 def get_raw_linter_settings(linter, view):
     # type: (Type[Linter], sublime.View) -> MutableMapping[str, Any]
-    """Return 'raw' linter settings without variables substituted.
-
-    Settings are merged in the following order:
-
-    default settings (on the class)
-    global user settings
-    project settings
-    view settings
-    """
+    """Return 'raw' linter settings without variables substituted."""
     defaults = linter.defaults or {}
     user_settings = persist.settings.get('linters', {}).get(linter.name, {})
 
@@ -317,6 +319,16 @@ def get_raw_linter_settings(linter, view):
     window = view.window()
     if window:
         data = window.project_data() or {}
+        if 'SublimeLinter' in data:
+            project_file_name = window.project_file_name()
+            deprecation_warning(
+                "Project settings for SublimeLinter have a new form and follow "
+                "Sublime's standard now. You can read more about it here: "
+                "http://www.sublimelinter.com/en/stable/settings.html#project-settings \n"
+                "If you just open '{}' now and save the file, a popup will "
+                "show the necessary changes."
+                .format(project_file_name)
+            )
         project_settings = (
             data.get('SublimeLinter', {})
                 .get('linters', {})
@@ -329,7 +341,14 @@ def get_raw_linter_settings(linter, view):
         view, 'SublimeLinter.linters.{}.'.format(linter.name)
     )  # type: Mapping[str, Any]  # type: ignore
 
-    return ChainMap({}, view_settings, project_settings, user_settings, defaults)
+    return ChainMap(
+        {},
+        view_settings,
+        project_settings,
+        user_settings,
+        defaults,
+        {'lint_mode': persist.settings.get('lint_mode')}
+    )
 
 
 def get_view_context(view, additional_context=None):
@@ -359,6 +378,8 @@ def get_view_context(view, additional_context=None):
         context['file_name'] = basename
         context['file_base_name'] = file_base_name
         context['file_extension'] = file_extension
+
+    context['canonical_filename'] = util.get_filename(view)
 
     if additional_context:
         context.update(additional_context)
@@ -429,12 +450,13 @@ class LinterMeta(type):
             'inline_settings', 'inline_overrides',
             'comment_re', 'shebang_match',
             'npm_name', 'composer_name',
-            'executable', 'executable_path'
+            'executable', 'executable_path',
+            'tab_width', 'config_file'
         ):
             if key in attrs:
                 logger.warning(
                     "{}: Defining 'cls.{}' has no effect. Please cleanup and "
-                    "remove these settings.".format(name, key))
+                    "remove this setting.".format(name, key))
 
         for key in ('build_cmd', 'insert_args'):
             if key in attrs:
@@ -446,7 +468,7 @@ class LinterMeta(type):
             if key in attrs:
                 logger.warning(
                     "{}: Implementing 'cls.{}' has no effect anymore. You "
-                    "can safely remove these methods.".format(name, key))
+                    "can safely remove this method.".format(name, key))
 
         if (
             'should_lint' in attrs
@@ -587,6 +609,7 @@ def register_linter(name, cls):
     # start, this is generally not necessary, because SL will trigger various
     # synthetic `on_activated_async` events on load.
     if persist.api_ready:
+        deprecation_warning.cache_clear()
         sublime.run_command('sublime_linter_config_changed')
         logger.info('{} linter reloaded'.format(name))
 
@@ -655,9 +678,6 @@ class Linter(metaclass=LinterMeta):
     # there is an error within the linter), you can ignore that stream by setting
     # this attribute to the other stream.
     error_stream = util.STREAM_BOTH
-
-    # Tab width
-    tab_width = 1
 
     # If a linter reports a column position, SublimeLinter highlights the nearest
     # word at that point. You can customize the regex used to highlight words
@@ -736,7 +756,7 @@ class Linter(metaclass=LinterMeta):
         window = self.view.window()
         if window:
             window.run_command('sublime_linter_failed', {
-                'bid': self.view.buffer_id(),
+                'filename': util.get_filename(self.view),
                 'linter_name': self.name
             })
 
@@ -745,7 +765,7 @@ class Linter(metaclass=LinterMeta):
         window = self.view.window()
         if window:
             window.run_command('sublime_linter_unassigned', {
-                'bid': self.view.buffer_id(),
+                'filename': util.get_filename(self.view),
                 'linter_name': self.name
             })
 
@@ -868,7 +888,12 @@ class Linter(metaclass=LinterMeta):
         if '${args}' in cmd:
             i = cmd.index('${args}')
             cmd[i:i + 1] = args
-        elif '*' in cmd:  # legacy SL3 crypto-identifier
+        elif '*' in cmd:
+            deprecation_warning(
+                "{}: Usage of '*' as a special marker in `cmd` has been "
+                "deprecated, use '${{args}}' instead."
+                .format(self.name)
+            )
             i = cmd.index('*')
             cmd[i:i + 1] = args
         else:
@@ -966,7 +991,7 @@ class Linter(metaclass=LinterMeta):
                 )
                 return None
 
-        return self.context.get('folder') or self.context.get('file_path')
+        return self.context.get('project_root') or self.context.get('folder') or self.context.get('file_path')
 
     def get_environment(self, settings=None):
         # type: (...) -> ChainMap
@@ -1040,8 +1065,7 @@ class Linter(metaclass=LinterMeta):
             )
             return True
 
-        fallback_mode = persist.settings.get('lint_mode', 'background')
-        lint_mode = settings.get('lint_mode', fallback_mode)
+        lint_mode = settings.get('lint_mode')
         if lint_mode not in ACCEPTED_REASONS_PER_MODE:
             logger.warning(
                 "{}: Unknown lint mode '{}'.  "
@@ -1281,7 +1305,7 @@ class Linter(metaclass=LinterMeta):
                 return None
         else:  # main file
             # use the filename of the current view
-            filename = self.view.file_name() or "<untitled {}>".format(self.view.buffer_id())
+            filename = util.get_filename(self.view)
 
         line = m.line  # type: int
         col = m.col    # type: Optional[int]
@@ -1297,8 +1321,6 @@ class Linter(metaclass=LinterMeta):
             )
 
         if col is not None:
-            col = self.maybe_fix_tab_width(line, col, vv)
-
             # Pin the column to the start/end line offsets
             start, end = vv.full_line(line)
             col = max(min(col, (end - start) - 1), 0)
@@ -1310,6 +1332,7 @@ class Linter(metaclass=LinterMeta):
         region = sublime.Region(line_start + start, line_start + end)
         if len(region) == 0:
             region.b += 1
+        offending_text = vv.substr(region)
 
         return {
             "filename": filename,
@@ -1320,6 +1343,7 @@ class Linter(metaclass=LinterMeta):
             "error_type": error_type,
             "code": code,
             "msg": m.message.strip(),
+            "offending_text": offending_text
         }
 
     def get_error_type(self, error, warning):
@@ -1330,6 +1354,7 @@ class Linter(metaclass=LinterMeta):
         else:
             return self.default_type
 
+    @lru_cache(maxsize=32)
     def normalize_filename(self, filename):
         # type: (Optional[str]) -> Optional[str]
         """Return an absolute filename if it is not the main file."""
@@ -1341,7 +1366,9 @@ class Linter(metaclass=LinterMeta):
 
         if not os.path.isabs(filename):
             cwd = self.get_working_dir() or os.getcwd()
-            filename = os.path.normpath(os.path.join(cwd, filename))
+            filename = os.path.join(cwd, filename)
+
+        filename = os.path.normpath(filename)
 
         # Some linters work on temp files but actually output 'real', user
         # filenames, so we need to check both.
@@ -1355,22 +1382,6 @@ class Linter(metaclass=LinterMeta):
     def is_stdin_filename(filename):
         # type: (str) -> bool
         return filename in ["stdin", "<stdin>", "-"]
-
-    def maybe_fix_tab_width(self, line, col, vv):
-        # type: (int, int, VirtualView) -> int
-        # Adjust column numbers to match the linter's tabs if necessary
-        if self.tab_width > 1:
-            code_line = vv.select_line(line)
-            diff = 0
-
-            for i in range(len(code_line)):
-                if code_line[i] == '\t':
-                    diff += (self.tab_width - 1)
-
-                if col - diff <= i:
-                    col = i
-                    break
-        return col
 
     def reposition_match(self, line, col, m, vv):
         # type: (int, Optional[int], LintMatch, VirtualView) -> Tuple[int, int, int]
@@ -1499,15 +1510,41 @@ class Linter(metaclass=LinterMeta):
         original_cmd = cmd
         cmd = substitute_variables(context, cmd)
         if '@' in cmd:
-            logger.info(
-                'The `@` symbol in cmd has been deprecated. Use $file, '
-                '$temp_file or $file_on_disk instead.')
+            if self.tempfile_suffix == '-':
+                deprecation_warning(
+                    "{}: Usage of '@' as a special marker in `cmd` "
+                    "has been deprecated, use '${{file_on_disk}}' instead."
+                    .format(self.name)
+                )
+            elif self.tempfile_suffix:
+                deprecation_warning(
+                    "{}: Usage of '@' as a special marker in `cmd` "
+                    "has been deprecated, use '${{temp_file}}' instead."
+                    .format(self.name)
+                )
+            else:
+                deprecation_warning(
+                    "{}: Usage of '@' as a special marker in `cmd` "
+                    "has been deprecated, use '${{file}}' instead."
+                    .format(self.name)
+                )
+
             cmd[cmd.index('@')] = at_value
 
         if cmd == original_cmd and auto_append:
-            logger.info(
-                'Automatically appending the filename to cmd has been '
-                'deprecated. Use $file, $temp_file or $file_on_disk instead.')
+            if self.tempfile_suffix == '-':
+                deprecation_warning(
+                    "{}: Implicit appending a filename to `cmd` "
+                    "has been deprecated, add '${{file_on_disk}}' explicitly."
+                    .format(self.name)
+                )
+            elif self.tempfile_suffix:
+                deprecation_warning(
+                    "{}: Implicit appending a filename to `cmd` "
+                    "has been deprecated, add '${{temp_file}}' explicitly."
+                    .format(self.name)
+                )
+
             cmd.append(at_value)
 
         return cmd
@@ -1665,7 +1702,11 @@ def make_nice_log_message(headline, cmd, is_stdin,
 
     filename = view.file_name()
     if filename and cwd:
-        rel_filename = os.path.relpath(filename, cwd)
+        rel_filename = (
+            os.path.relpath(filename, cwd)
+            if os.path.commonprefix([filename, cwd])
+            else filename
+        )
     elif not filename:
         rel_filename = '<buffer {}>'.format(view.buffer_id())
 
