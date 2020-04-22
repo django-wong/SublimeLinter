@@ -45,7 +45,7 @@ class TestResultRegexes(DeferrableTestCase):
         window = self.window = sublime.active_window()
         panel_view.ensure_panel(window)
         window.run_command('sublime_linter_panel_toggle')  # make it visible
-        self.create_view(window)
+        self.view = self.create_view(window)
 
     def tearDown(self):
         self.window.run_command('close_window')
@@ -92,3 +92,53 @@ class TestResultRegexes(DeferrableTestCase):
 
         results = panel.find_all_results()
         self.assertEqual(results, RESULT)
+
+    @p.expand(
+        [
+            (
+                {'/a.py': [std_error()], '/b.py': [std_error()], '/c.py': [std_error()]},
+                [('/b.py', 1, 1), ('/c.py', 1, 1), ('/a.py', 1, 1)],
+                '/a.py'
+            ),
+        ]
+    )
+    def test_active_file_comes_last(self, ERRORS, RESULT, ACTIVE_FILE):
+        window = self.window
+        when(panel_view).get_window_errors(...).thenReturn(ERRORS)
+        panel_view.State.update({
+            'active_view': self.view,
+            'active_filename': ACTIVE_FILE,
+            'cursor': 0
+        })
+
+        panel_view.fill_panel(window)
+        panel = panel_view.get_panel(window)
+        # The interface updates async.
+        yield lambda: panel.find(CODE, 0, sublime.LITERAL)
+
+        results = panel.find_all_results()
+        self.assertEqual(results, RESULT)
+
+    @p.expand(
+        [
+            (
+                {'/b.py': [std_error()], '/c.py': [std_error()]},
+                [('/b.py', 1, 1), ('/c.py', 1, 1)],
+                '/a.py'
+            ),
+        ]
+    )
+    def test_clean_active_file_displays_std_message(self, ERRORS, RESULT, ACTIVE_FILE):
+        window = self.window
+        when(panel_view).get_window_errors(...).thenReturn(ERRORS)
+        panel_view.State.update({
+            'active_view': self.view,
+            'active_filename': ACTIVE_FILE,
+            'cursor': 0
+        })
+
+        panel_view.fill_panel(window)
+        panel = panel_view.get_panel(window)
+        # The interface updates async.
+        match = yield lambda: panel.find('a.py:\n  No lint results', 0, sublime.LITERAL)
+        self.assertTrue(match)

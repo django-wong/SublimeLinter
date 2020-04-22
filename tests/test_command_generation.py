@@ -10,6 +10,7 @@ from SublimeLinter.lint import (
 from unittesting import DeferrableTestCase
 from SublimeLinter.tests.parameterized import parameterized as p
 from SublimeLinter.tests.mockito import (
+    contains,
     expect,
     mock,
     unstub,
@@ -168,17 +169,13 @@ class TestExecutableSetting(_BaseTestCase):
             cmd = ('fake_linter_1',)
             defaults = {'selector': None}
 
-        settings = {'executable': 'my_linter'}
-        result = ['my_linter']
+        EXECUTABLE = 'my_linter'
+        RESULT = ['resolved']
+        settings = {'executable': EXECUTABLE}
 
         linter = FakeLinter(self.view, settings)
-        # XXX: We probably don't need to test `can_exec`
-        # - Popen will also throw and show the error panel
-        # - User could just set e.g. 'linter.exe', and the OS will use PATH
-        #   to resolve that automatically
-        # - We don't check for arrays, see below
-        with when(util).can_exec('my_linter').thenReturn(True), \
-             expect(linter)._communicate(result, ...):  # noqa: E127
+        when(util).which('my_linter').thenReturn('resolved')
+        with expect(linter)._communicate(RESULT, ...):
             linter.lint(INPUT, VIEW_UNCHANGED)
 
     def test_executable_is_set_to_an_array(self):
@@ -186,12 +183,116 @@ class TestExecutableSetting(_BaseTestCase):
             cmd = ('fake_linter_1',)
             defaults = {'selector': None}
 
-        settings = {'executable': ['my_interpreter', 'my_linter']}
-        result = ['my_interpreter', 'my_linter']
+        EXECUTABLE = ['my_interpreter', 'my_linter']
+        RESULT = ['resolved', 'my_linter']
+        settings = {'executable': EXECUTABLE}
 
         linter = FakeLinter(self.view, settings)
-        with expect(linter)._communicate(result, ...):
+        when(util).which('my_interpreter').thenReturn('resolved')
+        with expect(linter)._communicate(RESULT, ...):
             linter.lint(INPUT, VIEW_UNCHANGED)
+
+    def test_unhappy_given_short_name(self):
+        class FakeLinter(Linter):
+            cmd = ('fake_linter_1',)
+            defaults = {'selector': None}
+
+        EXECUTABLE = 'my_linter'
+        settings = {'executable': EXECUTABLE}
+
+        linter = FakeLinter(self.view, settings)
+        when(linter).notify_failure().thenReturn(None)
+        when(util).which(...).thenReturn(None)
+        when(linter_module.logger).error(...)
+
+        try:
+            linter.lint(INPUT, VIEW_UNCHANGED)
+        except linter_module.PermanentError:
+            pass
+
+        verify(linter_module.logger).error(
+            contains(
+                "You set 'executable' to 'my_linter'.  "
+                "However, 'which my_linter' returned nothing.\n"
+                "Try setting an absolute path to the binary."
+            )
+        )
+        verify(linter).notify_failure()
+
+    def test_unhappy_given_abs_path(self):
+        class FakeLinter(Linter):
+            cmd = ('fake_linter_1',)
+            defaults = {'selector': None}
+
+        EXECUTABLE = '/usr/bin/my_linter'
+        settings = {'executable': EXECUTABLE}
+
+        linter = FakeLinter(self.view, settings)
+        when(linter).notify_failure().thenReturn(None)
+        when(util).which(...).thenReturn(None)
+        when(linter_module.logger).error(...)
+
+        try:
+            linter.lint(INPUT, VIEW_UNCHANGED)
+        except linter_module.PermanentError:
+            pass
+
+        verify(linter_module.logger).error(
+            "You set 'executable' to '/usr/bin/my_linter'.  However, "
+            "'/usr/bin/my_linter' does not exist or is not executable. "
+        )
+        verify(linter).notify_failure()
+
+    def test_unhappy_given_short_name_in_array(self):
+        class FakeLinter(Linter):
+            cmd = ('fake_linter_1',)
+            defaults = {'selector': None}
+
+        EXECUTABLE = ['my_interpreter', 'my_linter']
+        settings = {'executable': EXECUTABLE}
+
+        linter = FakeLinter(self.view, settings)
+        when(linter).notify_failure().thenReturn(None)
+        when(util).which(...).thenReturn(None)
+        when(linter_module.logger).error(...)
+
+        try:
+            linter.lint(INPUT, VIEW_UNCHANGED)
+        except linter_module.PermanentError:
+            pass
+
+        verify(linter_module.logger).error(
+            contains(
+                "You set 'executable' to ['my_interpreter', 'my_linter'].  "
+                "However, 'which my_interpreter' returned nothing.\n"
+                "Try setting an absolute path to the binary."
+            )
+        )
+        verify(linter).notify_failure()
+
+    def test_unhappy_given_abs_path_in_array(self):
+        class FakeLinter(Linter):
+            cmd = ('fake_linter_1',)
+            defaults = {'selector': None}
+
+        EXECUTABLE = ['/usr/bin/my_interpreter', 'my_linter']
+        settings = {'executable': EXECUTABLE}
+
+        linter = FakeLinter(self.view, settings)
+        when(linter).notify_failure().thenReturn(None)
+        when(util).which(...).thenReturn(None)
+        when(linter_module.logger).error(...)
+
+        try:
+            linter.lint(INPUT, VIEW_UNCHANGED)
+        except linter_module.PermanentError:
+            pass
+
+        verify(linter_module.logger).error(
+            "You set 'executable' to ['/usr/bin/my_interpreter', 'my_linter'].  "
+            "However, '/usr/bin/my_interpreter' does not exist or is not executable. "
+        )
+        verify(linter).notify_failure()
 
 
 class TestViewContext(_BaseTestCase):
@@ -212,6 +313,38 @@ class TestViewContext(_BaseTestCase):
 
         context = linter_module.get_view_context(self.view)
         self.assertEqual(RESULT, context.get('folder'))
+
+    def test_ensure_file_properties_come_from_given_view_case_saved_file(self):
+        sublime.run_command("new_window")
+        window = sublime.active_window()
+        self.addCleanup(window.run_command, 'close_window')
+
+        view = window.open_file(__file__, sublime.ENCODED_POSITION)
+
+        context = linter_module.get_view_context(view)
+        self.assertEqual(context.get('file'), __file__)
+
+    def test_ensure_file_properties_come_from_given_view_case_new_file(self):
+        sublime.run_command("new_window")
+        window = sublime.active_window()
+        self.addCleanup(window.run_command, 'close_window')
+
+        view = window.new_file()
+
+        context = linter_module.get_view_context(view)
+        self.assertEqual(context.get('file'), None)
+
+    def test_ensure_file_properties_come_from_given_view_not_the_active(self):
+        sublime.run_command("new_window")
+        window = sublime.active_window()
+        self.addCleanup(window.run_command, 'close_window')
+
+        unsaved_view = window.new_file()
+        focused_view = window.open_file(__file__, sublime.ENCODED_POSITION)
+        window.focus_view(focused_view)
+
+        context = linter_module.get_view_context(unsaved_view)
+        self.assertEqual(context.get('file', None), None)
 
 
 class TestLintModeSetting(_BaseTestCase):
@@ -426,6 +559,7 @@ class TestDeprecations(_BaseTestCase):
 
         window = mock(spec=sublime.Window)
         when(self.view).window().thenReturn(window)
+        when(window).extract_variables().thenReturn({})
         when(window).project_data().thenReturn({"SublimeLinter": {}})
         when(window).project_file_name().thenReturn(PROJECT_FILE_NAME)
         when(linter_module.logger).warning(...)

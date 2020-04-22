@@ -351,6 +351,18 @@ def get_raw_linter_settings(linter, view):
     )
 
 
+def _extract_window_variables(window):
+    # type: (sublime.Window) -> Dict[str, str]
+    # We explicitly want to compute all variables around the current file
+    # on our own.
+    variables = window.extract_variables()
+    for key in (
+        'file', 'file_path', 'file_name', 'file_base_name', 'file_extension'
+    ):
+        variables.pop(key, None)
+    return variables
+
+
 def get_view_context(view, additional_context=None):
     # type: (sublime.View, Optional[Mapping]) -> MutableMapping[str, str]
     # Note that we ship a enhanced version for 'folder' if you have multiple
@@ -358,7 +370,8 @@ def get_view_context(view, additional_context=None):
 
     window = view.window()
     context = ChainMap(
-        {}, window.extract_variables() if window else {}, os.environ)
+        {}, _extract_window_variables(window) if window else {}, os.environ
+    )  # type: MutableMapping[str, str]
 
     project_folder = guess_project_root_of_view(view)
     if project_folder:
@@ -830,19 +843,17 @@ class Linter(metaclass=LinterMeta):
                 # logged already.
                 return None
         else:
-            # If `cmd` is a method, it can try to find an executable on its own.
-            if util.can_exec(which):
-                path = which
-            else:
-                path = self.which(which)
-
+            path = self.which(which)
             if not path:
-                logger.warning('{} cannot locate \'{}\'\n'
-                               'Please refer to the readme of this plugin and our troubleshooting guide: '
-                               'http://www.sublimelinter.com/en/stable/troubleshooting.html'.format(self.name, which))
+                logger.warning(
+                    "{} cannot locate '{}'\n"
+                    "Please refer to the readme of this plugin and our troubleshooting guide: "
+                    "http://www.sublimelinter.com/en/stable/troubleshooting.html"
+                    .format(self.name, which)
+                )
                 return None
 
-        cmd[0:1] = util.convert_type(path, [])
+        cmd[0:1] = util.ensure_list(path)
         return self.insert_args(cmd)
 
     def context_sensitive_executable_path(self, cmd):
@@ -861,22 +872,34 @@ class Linter(metaclass=LinterMeta):
         Notable: `<path>` can be a list/tuple or str
 
         """
-        executable = self.settings.get('executable', None)
+        executable = self.settings.get('executable', None)  # type: Union[None, str, List[str]]
         if executable:
+            wanted_executable, *rest = util.ensure_list(executable)
+            resolved_executable = self.which(wanted_executable)
+            if not resolved_executable:
+                if os.path.isabs(wanted_executable):
+                    message = (
+                        "You set 'executable' to {!r}.  "
+                        "However, '{}' does not exist or is not executable. "
+                        .format(executable, wanted_executable)
+                    )
+                else:
+                    message = (
+                        "You set 'executable' to {!r}.  "
+                        "However, 'which {}' returned nothing.\n"
+                        "Try setting an absolute path to the binary. "
+                        "Also refer our troubleshooting guide: "
+                        "http://www.sublimelinter.com/en/stable/troubleshooting.html"
+                        .format(executable, wanted_executable)
+                    )
+                logger.error(message)
+                self.notify_failure()
+                raise PermanentError()
+
             logger.info(
-                "{}: wanted executable is '{}'".format(self.name, executable)
+                "{}: wanted executable is {!r}".format(self.name, executable)
             )
-
-            # If `executable` is an iterable, we can only assume it will work.
-            if isinstance(executable, str) and not util.can_exec(executable):
-                logger.error(
-                    "{} deactivated, cannot locate '{}' "
-                    .format(self.name, executable)
-                )
-                # no fallback, the user specified something, so we err
-                return True, None
-
-            return True, executable
+            return True, [resolved_executable] + rest
 
         return False, None
 
@@ -1019,10 +1042,10 @@ class Linter(metaclass=LinterMeta):
         if not cls.matches_selector(view, settings):
             return False
 
-        filename = view.file_name() or '<untitled>'
-        excludes = util.convert_type(settings.get('excludes', []), [])
+        excludes = settings.get('excludes', [])  # type: Union[str, List[str]]
         if excludes:
-            for pattern in excludes:
+            filename = view.file_name() or '<untitled>'
+            for pattern in util.ensure_list(excludes):
                 if pattern.startswith('!'):
                     matched = not fnmatch(filename, pattern[1:])
                 else:
